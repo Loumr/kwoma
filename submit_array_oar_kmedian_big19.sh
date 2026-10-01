@@ -102,7 +102,7 @@ OUTPUT="../results/kmedian_${W_TYPE}_n${N}_k${K}_${METHODS_LABEL}.parquet"
 
 echo "[submit] n=${N} k=${K} methods=${METHODS} w_type=${W_TYPE} epsilon=${EPSILON_VALUES} -> ${OUTPUT}"
 
-python3 ~/projet_kmowa/kwoma/kmowa.py \
+python3 ~/projet_kmowa/kmowa/kmowa.py \
     --n-values $N \
     --k-values $K \
     --w-type $W_TYPE \
