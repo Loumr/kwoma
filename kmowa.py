@@ -183,6 +183,7 @@ def _min1_min2_argmin(D_S: np.ndarray):
     return min1, min2, argmin1
  
  
+
 def _forward_greedy_init(dist_matrix: np.ndarray, k: int) -> np.ndarray:
     """
     Greedy initialization before the local search: add at each step the facility 
@@ -217,6 +218,7 @@ def local_search_single_swap(
     init: str = "greedy",
     seed: int = 0,
     max_iters: int | None = None,
+    tol: float = 1e-6
 ):
     """
     Local search from Arya et al., simple swap (ratio 5, or 5/(1-epsilon) with the threshold).
@@ -292,9 +294,15 @@ def local_search_single_swap(
  
         if best_swap is None:
             break  # local optimum reached
- 
-        if epsilon > 0 and best_cost > threshold * cost_S:
+
+        if threshold is None:
+            if best_cost >= cost_S:
+                break  # no improvement, stopping
+
+        elif best_cost > threshold * cost_S + tol:
             break  # insufficient amelioration, stopping to respect time guarantee
+ 
+ 
         
         # Update variables after the swap
         pos, f_new = best_swap
@@ -304,6 +312,7 @@ def local_search_single_swap(
         S_set.add(f_new)
  
         cost_S = best_cost
+        threshold = (1.0 - epsilon / Q) * cost_S if epsilon > 0 else None
  
     return sorted(S.tolist()), cost_S, it
 
