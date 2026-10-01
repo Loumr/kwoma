@@ -1,6 +1,5 @@
 import numpy as np
 import gurobipy as gp
-from scipy.optimize import linear_sum_assignment
 from gurobipy import GRB
 import pandas as pd
 import os
@@ -41,124 +40,6 @@ def costs_from_open_facilities(dist_matrix, S):
 #####################################################################
 ###################### ALGORITHMS IMPLEMENTATION ####################
 #####################################################################
-
-
-def min_lorenz(cost_matrix, W):
-    """
-    Compute all assignments minimizing the min sum version of the problem
-    with modified cost matrices and returns the best one 
-    """
-
-    costs = cost_matrix.copy()
-    n = np.shape(costs)[0]
-    _, assign = linear_sum_assignment(costs)
-
-    f_assign = compute_obj_matrix(np.eye(n, dtype=int)[assign], costs, W)
-
-    unique_solutions = set()
-    unique_solutions.add(tuple(assign))
-
-    for t in np.unique(costs)[1::]:
-        # Compute the temporary cost matrix where costs smaller than t are replaced by t
-        temp_costs_t = np.maximum(costs, t)
-
-        # Compute assignment minimizing the sum of the costs per agent with costs temp_costs_t
-        _, assign_t = linear_sum_assignment(temp_costs_t)
-
-        f_assign_t = compute_obj_matrix(np.eye(n, dtype=int)[assign_t], costs, W)
-
-        # Keep unique cost vectors
-        unique_solutions.add(tuple(assign_t))
-    
-        if f_assign_t < f_assign:
-            assign = assign_t
-            f_assign = f_assign_t
-
-    return assign, len(unique_solutions)
-
-
-
-
-
-
-def kmowa_solver(cost_matrix, k, W):
-    """
-    Exact MILP formulation of the OWA-weighted k-median problem, following
-    the dual-based OWA linearization of Chassein & Goerigk (2015).
-    :param cost_matrix: (n, n) distance matrix (clients = potential facility sites).
-    :param k: number of facilities to open.
-    :param W: OWA weight vector of length n.
-    :return: dict {"obj value", "x", "y", "z"}, or None if the solver
-        did not reach an optimal solution (time/memory limit).
-    """
-    costs = cost_matrix.copy()
-    n = np.shape(costs)[0]
-
-    m = gp.Model("OWA k-median")
-
-    m.setParam("Method", 1)     
-    m.setParam("Presolve", 0)
-    m.setParam("Crossover", 0)
-    m.setParam("NumericFocus", 3)
-    m.setParam("OutputFlag", 0)
-    m.setParam("Threads", 4)
-    m.setParam("MemLimit", 12000)
- 
-    # Add variables
-    alpha = m.addMVar(shape=n, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="alpha")
-    beta = m.addMVar(shape=n, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="beta")
-    x = m.addMVar(shape=(n, n), lb=0.0, vtype=GRB.BINARY, name="x")
-    y = m.addMVar(shape=n, lb=0.0, vtype=GRB.BINARY, name="y")
-    z = m.addMVar(n, lb=0.0, name="z")
-    
-    # Add constraints
-    # Constraints
-    for j in range(n):
-        m.addConstr(z[j] == gp.quicksum(costs[i, j] * x[i, j] for i in range(n)), name=f"linearization_z_{j}")
-
-    for i in range(n):
-        for j in range(n):
-            m.addConstr(alpha[i] + beta[j] - W[j] * z[i] >= 0)
-
-    for j in range(n):
-        m.addConstr(gp.quicksum(x[i, j] for i in range(n)) == 1, name=f"cover_{j}")
-
-    for i in range(n):
-        for j in range(n):
-            m.addConstr(x[i, j] <= y[i], name=f"open_{i}_{j}")
-
-    m.addConstr(gp.quicksum(y[i] for i in range(n)) <= k, name="k_facilities")
-
-    # Objective function
-    m.setObjective(gp.quicksum(alpha[i] + beta[i] for i in range(n)), GRB.MINIMIZE)
-
-    m.update()
-    m.optimize()
-
-    if m.Status in [GRB.TIME_LIMIT, GRB.INTERRUPTED]:
-        print("Time or memory limit reached.")
-        return None
-
-    if m.Status != GRB.OPTIMAL:
-        print("not optimal")
-        return None
-
-    obj = m.ObjVal
-    x_sol = x.X.reshape((n, n)).astype(int)
-    y_sol = y.X.astype(int)
-    z_sol = z.X.astype(np.float64)
-    
-    m.dispose()
-    del m
-    import gc; gc.collect()
-
-    return {"obj value" : obj,
-            "x" : x_sol,    
-            "y" : y_sol,
-            "z" : z_sol
-            }
-
-
 
 # ---------------------------------------------------------------------
 # Local Search Algorithm for k-median (Arya et al., 2004) 
@@ -246,7 +127,7 @@ def local_search_single_swap(
     Returns
     -------
     S : list[int]
-        Indices of open facilities (sike k).
+        Indices of open facilities (size k).
     cost : float
         Total cost of returned solution.
     n_iters : int
@@ -320,6 +201,135 @@ def local_search_single_swap(
     return sorted(S.tolist()), cost_S, it
 
 
+# ---------------------------------------------------------------------
+# Computation of approximation solutions for the min-sum k-median problem
+# with a Local Search Algorithm for k-median (Arya et al., 2004)
+# for different modified cost matrices (thresholding): application of our 
+# approximation algorithm for the k-median problem with OWA weights.
+# ---------------------------------------------------------------------
+
+
+def min_sum_k_median(cost_matrix, k, W, epsilon=0.0, init="greedy", seed=0):
+    """
+    Compute all assignments minimizing the min sum version of the problem
+    with modified cost matrices and returns the best one for the OWA objective.
+    """
+
+    costs = cost_matrix.copy()
+    n = np.shape(costs)[0]
+
+    # Compute the solution minimizing the sum of the costs per agent with costs costs
+    S, _, _ = local_search_single_swap(costs, k, epsilon=epsilon, init=init, seed=seed)
+    # Compute the corresponding OWA cost for this solution
+    cost_vect = costs_from_open_facilities(costs, S)
+    owa_obj = owa_cost(cost_vect, W)
+
+    unique_solutions = set()
+    unique_solutions.add(tuple(S))
+
+    for t in np.unique(costs)[1::]:
+        # Compute the temporary cost matrix where costs smaller than t are replaced by t
+        temp_costs_t = np.maximum(costs, t)
+
+        # Compute solution minimizing the sum of the costs per agent with costs temp_costs_t
+        S_t, _, _ = local_search_single_swap(temp_costs_t, k, epsilon=epsilon, init=init, seed=seed)
+        # Compute the corresponding OWA cost for this solution
+        cost_vect_t = costs_from_open_facilities(costs, S_t)
+        owa_obj_t = owa_cost(cost_vect_t, W)
+
+        # Keep unique cost vectors
+        unique_solutions.add(tuple(S_t))
+    
+        if owa_obj_t < owa_obj:
+            S = S_t
+            owa_obj = owa_obj_t
+
+    return S, len(unique_solutions)
+
+
+
+
+
+def kmowa_solver(cost_matrix, k, W):
+    """
+    Exact MILP formulation of the OWA-weighted k-median problem, following
+    the dual-based OWA linearization of Chassein & Goerigk (2015).
+    :param cost_matrix: (n, n) distance matrix (clients = potential facility sites).
+    :param k: number of facilities to open.
+    :param W: OWA weight vector of length n.
+    :return: dict {"obj value", "x", "y", "z"}, or None if the solver
+        did not reach an optimal solution (time/memory limit).
+    """
+    costs = cost_matrix.copy()
+    n = np.shape(costs)[0]
+
+    m = gp.Model("OWA k-median")
+
+    m.setParam("Method", 1)     
+    m.setParam("Presolve", 0)
+    m.setParam("Crossover", 0)
+    m.setParam("NumericFocus", 3)
+    m.setParam("OutputFlag", 0)
+    m.setParam("Threads", 4)
+    m.setParam("MemLimit", 12000)
+ 
+    # Add variables
+    alpha = m.addMVar(shape=n, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="alpha")
+    beta = m.addMVar(shape=n, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="beta")
+    x = m.addMVar(shape=(n, n), lb=0.0, vtype=GRB.BINARY, name="x")
+    y = m.addMVar(shape=n, lb=0.0, vtype=GRB.BINARY, name="y")
+    z = m.addMVar(n, lb=0.0, name="z")
+    
+    # Add constraints
+    # Constraints
+    for j in range(n):
+        m.addConstr(z[j] == gp.quicksum(costs[i, j] * x[i, j] for i in range(n)), name=f"linearization_z_{j}")
+
+    for i in range(n):
+        for j in range(n):
+            m.addConstr(alpha[i] + beta[j] - W[j] * z[i] >= 0)
+
+    for j in range(n):
+        m.addConstr(gp.quicksum(x[i, j] for i in range(n)) == 1, name=f"cover_{j}")
+
+    for i in range(n):
+        for j in range(n):
+            m.addConstr(x[i, j] <= y[i], name=f"open_{i}_{j}")
+
+    m.addConstr(gp.quicksum(y[i] for i in range(n)) <= k, name="k_facilities")
+
+    # Objective function
+    m.setObjective(gp.quicksum(alpha[i] + beta[i] for i in range(n)), GRB.MINIMIZE)
+
+    m.update()
+    m.optimize()
+
+    if m.Status in [GRB.TIME_LIMIT, GRB.INTERRUPTED]:
+        print("Time or memory limit reached.")
+        return None
+
+    if m.Status != GRB.OPTIMAL:
+        print("not optimal")
+        return None
+
+    obj = m.ObjVal
+    x_sol = x.X.reshape((n, n)).astype(int)
+    y_sol = y.X.astype(int)
+    z_sol = z.X.astype(np.float64)
+    
+    m.dispose()
+    del m
+    import gc; gc.collect()
+
+    return {"obj value" : obj,
+            "x" : x_sol,    
+            "y" : y_sol,
+            "z" : z_sol
+            }
+
+
+
+
 
 
 #####################################################################
@@ -362,9 +372,9 @@ def _is_missing(value) -> bool:
 # Parquet upsert (called after every single instance)
 # -------------------------------------------------------------------
  
-# Default upsert key for this file's results: (n, k, seed, instance) 
+# Default upsert key for this file's results: (n, k, epsilon, seed, instance) 
 # -- two different k values on the same n are unrelated problems and must never be confused.
-KEY_COLS = ["n", "k", "seed", "instance"]
+KEY_COLS = ["n", "k", "epsilon", "seed", "instance"]
  
  
 def _upsert_parquet(row: dict, parquet_path: str, key_cols=None) -> None:
@@ -611,42 +621,39 @@ def run_one(cost_matrix, W, n, k, instance, seed, budget: TimeBudget, w_type,
             methods=None, exact_cache_path=None, ls_epsilon=0.0, ls_init="greedy"):
     """
     Runs the requested methods on a single instance and returns one
-    result row. methods : subset of {'local_search', 'exact'}. None = both.
+    result row. methods : subset of {'min_sum_k_median', 'exact'}. None = both.
  
-    Note: local_search_single_swap optimizes the SUM objective (plain
-    k-median), not the OWA-weighted one. Its result is reported both as
-    its own (sum) objective, and re-evaluated under the OWA weights W via
-    owa_cost, for comparison with the 'exact' OWA-optimal value --
-    these two numbers answer different questions (see module docstring
-    of the local search section) and should not be confused.
+    Note: min_sum_k_median (the thresholding heuristic built on top of
+    local_search_single_swap, mirroring k_fowama.min_lorenz for the
+    assignment problem) targets the OWA objective directly, but is NOT
+    proven exact for general OWA weights -- like min_lorenz, it can land
+    a few percent above the true optimum on some instances (verified: up
+    to ~8% on small random instances). Comparing it against kmowa_solver
+    (exact) is exactly how to measure that gap for your own instances.
     """
     if methods is None:
-        methods = {"local_search", "exact"}
+        methods = {"min_sum_k_median", "exact"}
  
-    row = {"n": n, "k": k, "instance": instance, "seed": seed}
+    row = {"n": n, "k": k, "epsilon": ls_epsilon, "instance": instance, "seed": seed}
  
-    # --- local_search (plain k-median approximation, Arya et al.) ---
-    if "local_search" not in methods:
-        row["local_search_time"] = np.nan
-        row["local_search_sum_obj"] = np.nan
-        row["local_search_owa_obj"] = np.nan
-        row["local_search_nb_iters"] = np.nan
-    elif budget.should_run("local_search", n, k):
+    # --- min_sum_k_median (OWA k-median heuristic via thresholding) ---
+    if "min_sum_k_median" not in methods:
+        row["min_sum_k_median_time"] = np.nan
+        row["min_sum_k_median_owa_obj"] = np.nan
+        row["min_sum_k_median_nb_sols"] = np.nan
+    elif budget.should_run("min_sum_k_median", n, k):
         start = time.time()
-        S, sum_obj, nb_iters = local_search_single_swap(
-            cost_matrix, k, epsilon=ls_epsilon, init=ls_init, seed=seed
-        )
+        S, nb_sols = min_sum_k_median(cost_matrix, k, W, epsilon=ls_epsilon, init=ls_init, seed=seed)
         elapsed = time.time() - start
-        budget.record("local_search", n, k, elapsed)
-        row["local_search_time"] = elapsed
-        row["local_search_sum_obj"] = sum_obj
-        row["local_search_owa_obj"] = owa_cost(costs_from_open_facilities(cost_matrix, S), W)
-        row["local_search_nb_iters"] = nb_iters
+        budget.record("min_sum_k_median", n, k, elapsed)
+        costs_S = costs_from_open_facilities(cost_matrix, S)
+        row["min_sum_k_median_time"] = elapsed
+        row["min_sum_k_median_owa_obj"] = owa_cost(costs_S, W)
+        row["min_sum_k_median_nb_sols"] = nb_sols
     else:
-        row["local_search_time"] = np.nan
-        row["local_search_sum_obj"] = np.nan
-        row["local_search_owa_obj"] = np.nan
-        row["local_search_nb_iters"] = np.nan
+        row["min_sum_k_median_time"] = np.nan
+        row["min_sum_k_median_owa_obj"] = np.nan
+        row["min_sum_k_median_nb_sols"] = np.nan
  
     # --- exact (Gurobi, OWA-optimal, with shared cache) ---
     if "exact" not in methods:
@@ -666,19 +673,21 @@ def run_one(cost_matrix, W, n, k, instance, seed, budget: TimeBudget, w_type,
             row["exact_time"] = np.nan
             row["exact_owa_obj"] = np.nan
  
-    # --- ratio (OWA objective, local_search vs exact) ---
-    if not np.isnan(row["exact_owa_obj"]) and row["exact_owa_obj"] > 0 and not np.isnan(row["local_search_owa_obj"]):
-        row["ratio_local_search"] = row["local_search_owa_obj"] / row["exact_owa_obj"]
+    # --- ratio (OWA objective, min_sum_k_median vs exact) ---
+    if not np.isnan(row["exact_owa_obj"]) and row["exact_owa_obj"] > 0 and not np.isnan(row["min_sum_k_median_owa_obj"]):
+        row["ratio_min_sum_k_median"] = row["min_sum_k_median_owa_obj"] / row["exact_owa_obj"]
     else:
-        row["ratio_local_search"] = np.nan
+        row["ratio_min_sum_k_median"] = np.nan
  
     return row
+
+
  
  
 def run_comparison(
     n_values,
     w_type,
-    k,
+    k_values,
     nb_instances=30,
     seed=0,
     time_limit=1800.0,
@@ -687,19 +696,27 @@ def run_comparison(
     instance_end=None,
     methods=None,
     exact_cache_dir="results",
-    ls_epsilon=0.0,
+    epsilon_values=(0.0,),
     ls_init="greedy",
 ):
     """
-    Compares local_search_single_swap and kmowa_solver (exact) over a set
-    of metric k-median instances, one row per instance, upserted into a
-    parquet file after each instance (same pattern as
+    Compares min_sum_k_median and kmowa_solver (exact) over a grid of
+    metric k-median instances swept across n_values x k_values x
+    epsilon_values, one row per (n, k, epsilon, instance), upserted into
+    a parquet file after each instance (same pattern as
     compare_min_lorenz.run_comparison).
+ 
+    epsilon_values only affects min_sum_k_median (it has no meaning for
+    the exact MILP). epsilon is looped as the INNERMOST dimension so
+    that, for a given (n, k, seed, instance), 'exact' is computed (or
+    looked up from cache) ONCE and reused across every epsilon value --
+    no extra Gurobi calls just from sweeping epsilon.
  
     Requires generate_instances_k_median.py (random_metric_costs,
     get_weights) to generate instances with the triangle inequality and
-    OWA weights -- imported lazily below to avoid a hard dependency for
-    callers who only need the algorithms themselves.
+    the SAME OWA weight families as the assignment problem (k_fowama.py)
+    -- imported lazily below to avoid a hard dependency for callers who
+    only need the algorithms themselves.
     """
     from generate_instances_k_median import random_metric_costs, get_weights
  
@@ -707,95 +724,106 @@ def run_comparison(
     budget = TimeBudget(limit_seconds=time_limit, nb_instances=nb_instances)
  
     if output_path is None:
-        output_path = f"results/kmedian_{w_type}_k{k}.parquet"
+        output_path = f"results/kmedian_{w_type}.parquet"
  
     rows = []
     for n in n_values:
         cost_matrices = [random_metric_costs(n, seed=seed + i) for i in range(nb_instances)]
-        exact_cache_path = default_exact_cache_path(w_type, n, k, exact_cache_dir)
-        for i in range(instance_start, instance_end):
-            W = get_weights(w_type, n, i)
-            cost_matrix = cost_matrices[i]
+        for k in k_values:
+            exact_cache_path = default_exact_cache_path(w_type, n, k, exact_cache_dir)
+            for i in range(instance_start, instance_end):
+                W = get_weights(w_type, n, i)
+                cost_matrix = cost_matrices[i]
  
-            skip_info = []
-            for method in ["local_search", "exact"]:
-                if budget.is_stopped(method, n, k):
-                    skip_info.append(
-                        f"{method} (cumul={budget.current_total(method, n, k):.0f}s "
-                        f"> budget={budget.total_budget:.0f}s)"
+                skip_info = []
+                for method in ["min_sum_k_median", "exact"]:
+                    if budget.is_stopped(method, n, k):
+                        skip_info.append(
+                            f"{method} (cumul={budget.current_total(method, n, k):.0f}s "
+                            f"> budget={budget.total_budget:.0f}s)"
+                        )
+                skip_str = f" [STOPPED: {', '.join(skip_info)}]" if skip_info else ""
+ 
+                for eps in epsilon_values:
+                    print(f"[running] n={n} k={k} epsilon={eps} instance={i} w_type={w_type}{skip_str}")
+ 
+                    row = run_one(
+                        cost_matrix, W, n, k, i, seed, budget, w_type,
+                        methods=methods, exact_cache_path=exact_cache_path,
+                        ls_epsilon=eps, ls_init=ls_init,
                     )
-            skip_str = f" [STOPPED: {', '.join(skip_info)}]" if skip_info else ""
+                    row["w_type"] = w_type
+                    rows.append(row)
  
-            print(f"[running] n={n} k={k} instance={i} w_type={w_type}{skip_str}")
+                    _upsert_parquet(row, output_path)
  
-            row = run_one(
-                cost_matrix, W, n, k, i, seed, budget, w_type,
-                methods=methods, exact_cache_path=exact_cache_path,
-                ls_epsilon=ls_epsilon, ls_init=ls_init,
-            )
-            row["w_type"] = w_type
-            rows.append(row)
+                    def fmt(v):
+                        return "  --  " if (v is None or (isinstance(v, float) and np.isnan(v))) else f"{v:.4f}"
  
-            _upsert_parquet(row, output_path)
- 
-            def fmt(v):
-                return "  --  " if (v is None or (isinstance(v, float) and np.isnan(v))) else f"{v:.4f}"
- 
-            print(f"  -> local_search: {fmt(row['local_search_time'])} (OWA obj {fmt(row['local_search_owa_obj'])})  "
-                  f"exact: {fmt(row['exact_time'])} (OWA obj {fmt(row['exact_owa_obj'])})  "
-                  f"ratio: {fmt(row['ratio_local_search'])}")
+                    print(f"  -> min_sum_k_median: {fmt(row['min_sum_k_median_time'])} "
+                          f"(OWA obj {fmt(row['min_sum_k_median_owa_obj'])})  "
+                          f"exact: {fmt(row['exact_time'])} (OWA obj {fmt(row['exact_owa_obj'])})  "
+                          f"ratio: {fmt(row['ratio_min_sum_k_median'])}")
  
     return pd.DataFrame(rows)
+ 
+
  
  
 def print_comparison(df: pd.DataFrame):
     pd.set_option("display.width", 160)
  
-    agg = df.groupby(["w_type", "n", "k"]).agg(
+    agg = df.groupby(["w_type", "n", "k", "epsilon"]).agg(
         instances=("instance", "count"),
-        local_search_time=("local_search_time", "mean"),
+        min_sum_k_median_time=("min_sum_k_median_time", "mean"),
         exact_time=("exact_time", "mean"),
-        ratio_mean=("ratio_local_search", "mean"),
-        ratio_max=("ratio_local_search", "max"),
+        ratio_mean=("ratio_min_sum_k_median", "mean"),
+        ratio_max=("ratio_min_sum_k_median", "max"),
         n_exact=("exact_owa_obj", lambda s: s.notna().sum()),
-        n_ls=("local_search_owa_obj", lambda s: s.notna().sum()),
+        n_ls=("min_sum_k_median_owa_obj", lambda s: s.notna().sum()),
     ).reset_index()
  
     for w_type in agg["w_type"].unique():
-        sub = agg[agg["w_type"] == w_type].sort_values(["k", "n"])
-        print(f"\n{'=' * 100}\n{w_type}\n{'=' * 100}")
-        print(f"{'n':>5} {'k':>5} {'inst':>5} | {'n_ls':>5} {'n_exact':>7} | "
+        sub = agg[agg["w_type"] == w_type].sort_values(["k", "n", "epsilon"])
+        print(f"\n{'=' * 110}\n{w_type}\n{'=' * 110}")
+        print(f"{'n':>5} {'k':>5} {'eps':>6} {'inst':>5} | {'n_ls':>5} {'n_exact':>7} | "
               f"{'t_ls':>9} {'t_exact':>9} | {'ratio':>10} {'max':>7}")
         for _, r in sub.iterrows():
             def fmt(v):
                 return "  --  " if np.isnan(v) else f"{v:.4f}"
-            print(f"{int(r.n):>5} {int(r.k):>5} {int(r.instances):>5} | "
+            print(f"{int(r.n):>5} {int(r.k):>5} {r.epsilon:>6.2f} {int(r.instances):>5} | "
                   f"{int(r.n_ls):>5} {int(r.n_exact):>7} | "
-                  f"{fmt(r.local_search_time):>9} {fmt(r.exact_time):>9} | "
+                  f"{fmt(r.min_sum_k_median_time):>9} {fmt(r.exact_time):>9} | "
                   f"{fmt(r.ratio_mean):>10} {fmt(r.ratio_max):>7}")
  
-    print(f"\n{'=' * 100}\n{len(df)} runs total")
+    print(f"\n{'=' * 110}\n{len(df)} runs total")
  
  
+
 if __name__ == "__main__":
     import argparse
  
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-values", type=int, nargs="+", default=[20, 30])
-    parser.add_argument("--k", type=int, required=True, help="number of facilities to open")
+    parser.add_argument("--k-values", type=int, nargs="+", required=True,
+                         help="numbers of facilities to open (swept, like --n-values).")
     parser.add_argument("--w-type", default="s_gini_1.5_weights")
     parser.add_argument("--nb-instances", type=int, default=30)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--time-limit", type=float, default=1800.0,
-                         help="average time budget (s) per (method, n, k) -- default 1800s.")
+                         help="average time budget (s) per (method, n, k) -- default 1800s. "
+                              "Shared across all epsilon values tested for a given (method, n, k).")
     parser.add_argument("--methods", default=None,
-                         help="comma-separated subset of local_search,exact. Default: both.")
+                         help="comma-separated subset of min_sum_k_median,exact. Default: both.")
     parser.add_argument("--instance-start", type=int, default=0)
     parser.add_argument("--instance-end", type=int, default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--exact-cache-dir", default="results")
-    parser.add_argument("--ls-epsilon", type=float, default=0.0,
-                         help="local_search_single_swap's epsilon (0 = naive, >0 = time-guaranteed).")
+    parser.add_argument("--epsilon-values", type=float, nargs="+", default=[0.0],
+                         help="min_sum_k_median's epsilon values to sweep (0 = naive, "
+                              ">0 = time-guaranteed). Has no effect on 'exact'; 'exact' is "
+                              "computed/cached once per (n, k, seed, instance) and reused "
+                              "across every epsilon value.")
     parser.add_argument("--ls-init", default="greedy", choices=["greedy", "random"])
     args = parser.parse_args()
  
@@ -803,16 +831,16 @@ if __name__ == "__main__":
     if output_path is None:
         if args.instance_start != 0 or args.instance_end is not None:
             end = args.instance_end if args.instance_end is not None else args.nb_instances
-            output_path = f"results/kmedian_{args.w_type}_k{args.k}_inst{args.instance_start}-{end}.parquet"
+            output_path = f"results/kmedian_{args.w_type}_inst{args.instance_start}-{end}.parquet"
         else:
-            output_path = f"results/kmedian_{args.w_type}_k{args.k}.parquet"
+            output_path = f"results/kmedian_{args.w_type}.parquet"
  
     methods = set(args.methods.split(",")) if args.methods else None
  
     df = run_comparison(
         n_values=args.n_values,
         w_type=args.w_type,
-        k=args.k,
+        k_values=args.k_values,
         nb_instances=args.nb_instances,
         seed=args.seed,
         time_limit=args.time_limit,
@@ -821,7 +849,7 @@ if __name__ == "__main__":
         instance_end=args.instance_end,
         methods=methods,
         exact_cache_dir=args.exact_cache_dir,
-        ls_epsilon=args.ls_epsilon,
+        epsilon_values=args.epsilon_values,
         ls_init=args.ls_init,
     )
     print_comparison(df)
