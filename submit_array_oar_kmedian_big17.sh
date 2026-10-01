@@ -98,7 +98,7 @@ mkdir -p results logs
 # instance donnee (cache partage dans kmowa.solve_exact_cached), donc
 # balayer epsilon ne multiplie pas les appels a Gurobi, meme si 'exact'
 # tourne dans son propre job.
-OUTPUT="results/kmedian_${W_TYPE}_n${N}_k${K}_${METHODS_LABEL}.parquet"
+OUTPUT="../results/kmedian_${W_TYPE}_n${N}_k${K}_${METHODS_LABEL}.parquet"
 
 echo "[submit] n=${N} k=${K} methods=${METHODS} w_type=${W_TYPE} epsilon=${EPSILON_VALUES} -> ${OUTPUT}"
 
