@@ -2,23 +2,13 @@ import numpy as np
 import gurobipy as gp
 from scipy.optimize import linear_sum_assignment
 from gurobipy import GRB
-import numpy.typing as npt
 import pandas as pd
 import os
 import time
 import sys
 import fcntl
-import multiprocessing
 import traceback
-import random
-import glob
-import re
-import lap as lp
-from pathlib import Path
-from openpyxl import Workbook
-from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
+
 
 
 #####################################################################
@@ -26,18 +16,25 @@ from openpyxl.utils import get_column_letter
 #####################################################################
 
 
-# ------------------------------------------------------------------
-# Generation d'instances
-# ------------------------------------------------------------------
-
-def compute_obj_matrix(x_sol, cost_matrix, W):
+def owa_cost(costs, W):
     """
-    Compute objective .
+    Computes the OWA-aggregated value of a 1D vector of per-client costs.
+    :param costs: 1D array of length n (one cost per client, e.g. the
+        distance from each client to its assigned open facility).
+    :param W: 1D array of length n, OWA weights.
+    :return: float, the weighted sum of the sorted costs.
     """
-    row_costs = (cost_matrix * x_sol).sum(axis=1)
+    return float(np.dot(W, np.sort(np.asarray(costs))[::-1]))
 
-    return np.dot(W, np.sort(row_costs)[::-1])
 
+
+def costs_from_open_facilities(dist_matrix, S):
+    """
+    Given a (n_clients, n_facilities) distance matrix and a set S of open
+    facility indices, returns the 1D vector of per-client costs under
+    nearest-open-facility assignment.
+    """
+    return dist_matrix[:, list(S)].min(axis=1)
 
 
 
@@ -85,10 +82,17 @@ def min_lorenz(cost_matrix, W):
 
 
 def kmowa_solver(cost_matrix, k, W):
-    "MILP formulation of the OWA k-median problem with Chassein and Goerigk (2015) formulation"
+    """
+    Exact MILP formulation of the OWA-weighted k-median problem, following
+    the dual-based OWA linearization of Chassein & Goerigk (2015).
+    :param cost_matrix: (n, n) distance matrix (clients = potential facility sites).
+    :param k: number of facilities to open.
+    :param W: OWA weight vector of length n.
+    :return: dict {"obj value", "x", "y", "z"}, or None if the solver
+        did not reach an optimal solution (time/memory limit).
+    """
     costs = cost_matrix.copy()
     n = np.shape(costs)[0]
-   
 
     m = gp.Model("OWA k-median")
 
@@ -99,8 +103,6 @@ def kmowa_solver(cost_matrix, k, W):
     m.setParam("OutputFlag", 0)
     m.setParam("Threads", 4)
     m.setParam("MemLimit", 12000)
-    m.setParam("NumericFocus", 3)
-
  
     # Add variables
     alpha = m.addMVar(shape=n, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="alpha")
@@ -127,12 +129,10 @@ def kmowa_solver(cost_matrix, k, W):
 
     m.addConstr(gp.quicksum(y[i] for i in range(n)) <= k, name="k_facilities")
 
-
     # Objective function
     m.setObjective(gp.quicksum(alpha[i] + beta[i] for i in range(n)), GRB.MINIMIZE)
 
     m.update()
-
     m.optimize()
 
     if m.Status in [GRB.TIME_LIMIT, GRB.INTERRUPTED]:
@@ -161,8 +161,9 @@ def kmowa_solver(cost_matrix, k, W):
 
 
 # ---------------------------------------------------------------------
-# Local Search Algorithm for k-median
+# Local Search Algorithm for k-median (Arya et al., 2004) 
 # Version efficace (threshold) : swap simple (p=1), ratio 5
+# (or 5/(1-epsilon) with the polynomial-time threshold variant).
 # ---------------------------------------------------------------------
  
 def _min1_min2_argmin(D_S: np.ndarray):
@@ -196,16 +197,19 @@ def _forward_greedy_init(dist_matrix: np.ndarray, k: int) -> np.ndarray:
     current_min = np.full(n_clients, np.inf)  # distance to the nearest open facility (np.inf for now)
     remaining = set(range(n_facilities))
  
-    for _ in range(k): # Choose each facility one by one
+    for _ in range(k): # choose each facility one by one
         best_f, best_cost = None, np.inf
         for f in remaining:
             new_min = np.minimum(current_min, dist_matrix[:, f])
             c = new_min.sum()
             if c < best_cost:
                 best_cost, best_f = c, f
-        chosen.append(best_f)
-        remaining.discard(best_f)
-        current_min = np.minimum(current_min, dist_matrix[:, best_f])
+        if best_f is not None:
+            chosen.append(best_f)
+            remaining.discard(best_f)
+            current_min = np.minimum(current_min, dist_matrix[:, best_f])
+        else:
+            break  # no more facilities to choose from
  
     return np.array(chosen)
  
@@ -248,6 +252,7 @@ def local_search_single_swap(
     n_iters : int
         Number of iterations.
     """
+    dist_matrix = np.asarray(dist_matrix, dtype=float)
     n_clients, n_facilities = dist_matrix.shape
     if k >= n_facilities:
         raise ValueError("k must be less than the number of possible facilities")
@@ -265,7 +270,8 @@ def local_search_single_swap(
         return float(dist_matrix[:, S_arr].min(axis=1).sum())
  
     cost_S = total_cost(S)
-    threshold = (1.0 - epsilon / Q) if epsilon > 0 else None
+
+    ratio = (1.0 - epsilon / Q) if epsilon > 0 else None
  
     it = 0
     while max_iters is None or it < max_iters:
@@ -295,16 +301,14 @@ def local_search_single_swap(
         if best_swap is None:
             break  # local optimum reached
 
-        if threshold is None:
+        if ratio is None:
             if best_cost >= cost_S:
                 break  # no improvement, stopping
 
-        elif best_cost > threshold * cost_S + tol:
-            break  # insufficient amelioration, stopping to respect time guarantee
+        elif best_cost > ratio * cost_S + tol:
+            break  # insufficient amelioration, stopping to respect the time guarantee
  
- 
-        
-        # Update variables after the swap
+        # Apply the swap
         pos, f_new = best_swap
         s_old = int(S[pos])
         S[pos] = f_new
@@ -312,60 +316,24 @@ def local_search_single_swap(
         S_set.add(f_new)
  
         cost_S = best_cost
-        threshold = (1.0 - epsilon / Q) * cost_S if epsilon > 0 else None
  
     return sorted(S.tolist()), cost_S, it
+
 
 
 
 #####################################################################
 ######################### TESTING AND EXPORT ########################
 #####################################################################
-
-
+ 
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
-
-def wrapper(q, func, args):
-    try:
-        res = func(*args)
-        q.put(("OK", res))
-    except Exception:
-        q.put(("ERR", traceback.format_exc()))
-
-
-
-
-def run_with_timeout(func, args=(), timeout=10):
-    q = multiprocessing.Queue()
-    p = multiprocessing.Process(target=wrapper, args=(q, func, args))
-    p.start()
-    p.join(timeout)
-
-    if p.is_alive():
-        p.terminate()
-        p.join()
-        return "TIMEOUT"
-
-    if not q.empty():
-        status, result = q.get()
-        if status == "ERR":
-            print(result)
-            raise RuntimeError("Error in child process")
-        return result
-
-    return None
-
-
-
-
+ 
 def _solution_to_vector(x: np.ndarray) -> np.ndarray:
     """
-    Convert an assignment solution to a 1D vector of size n where
-    tab[i] is the index of the object assigned to agent i.
-    Accepts either a 1D vector (returned as-is) or an n x n
-    permutation matrix (argmax along rows).
+    Convert a solution to a 1D vector. Accepts either a 1D vector
+    (returned as-is) or an n x n assignment matrix (argmax along rows).
     """
     x = np.asarray(x)
     if x.ndim == 1:
@@ -373,14 +341,12 @@ def _solution_to_vector(x: np.ndarray) -> np.ndarray:
     if x.ndim == 2:
         return np.argmax(x, axis=1).astype(int)
     raise ValueError(f"Unexpected solution dimension: {x.ndim}")
-
-
-
-
+ 
+ 
 def _is_missing(value) -> bool:
     """
-    Scalar-and-array-aware missing value check.
-    pd.isna() raises on numpy arrays, so we handle them separately.
+    Scalar-and-array-aware missing value check. pd.isna() raises on
+    numpy arrays, so they are handled separately.
     """
     if value is None:
         return True
@@ -390,23 +356,26 @@ def _is_missing(value) -> bool:
         return bool(pd.isna(value))
     except (TypeError, ValueError):
         return False
-
-
-
-
-
+ 
+ 
 # -------------------------------------------------------------------
 # Parquet upsert (called after every single instance)
 # -------------------------------------------------------------------
+ 
+# Default upsert key for this file's results: (n, k, seed, instance) 
+# -- two different k values on the same n are unrelated problems and must never be confused.
+KEY_COLS = ["n", "k", "seed", "instance"]
+ 
+ 
 def _upsert_parquet(row: dict, parquet_path: str, key_cols=None) -> None:
     """
-    Append a single result row to the method-specific parquet file.
-    If a row with the same key (key_cols, default KEY_COLS = n, seed, instance)
-    already exists, it is replaced by the new one (keep last).
+    Append a single result row to the method-specific parquet file. If a
+    row with the same key (key_cols, default KEY_COLS = n, k, seed,
+    instance) already exists, it is replaced by the new one (keep last).
     """
     key_cols = KEY_COLS if key_cols is None else key_cols
     df_new = pd.DataFrame([row])
-
+ 
     if os.path.exists(parquet_path):
         df_old = pd.read_parquet(parquet_path)
         df_combined = pd.concat([df_old, df_new], ignore_index=True)
@@ -418,37 +387,32 @@ def _upsert_parquet(row: dict, parquet_path: str, key_cols=None) -> None:
         )
     else:
         df_combined = df_new
-
+ 
     df_combined.to_parquet(parquet_path, index=False)
-
-
-
+ 
+ 
 # -------------------------------------------------------------------
-# Cache "exact" results (Gurobi)
+# Cache for "exact" results (Gurobi)
 # -------------------------------------------------------------------
-
-EXACT_CACHE_KEY_COLS = ["w_type", "n", "seed", "instance"]
-
-
-def default_exact_cache_path(w_type, n, cache_dir="results"):
+ 
+# k is now part of the cache key (see KEY_COLS note above: two
+# different k are two different problems for the same instance).
+EXACT_CACHE_KEY_COLS = ["w_type", "n", "k", "seed", "instance"]
+ 
+ 
+def default_exact_cache_path(w_type, n, k, cache_dir="results"):
     """
-    Chemin par defaut du cache exact, UN FICHIER PAR (w_type, n) --
-    aligne sur le decoupage des jobs OAR (un job par n dans
-    submit_array_oar.sh), pour qu'un job donne ne lise/n'ecrive jamais
-    dans le meme fichier qu'un job traitant un autre n. Le seul risque
-    de concurrence restant est un job compare_min_lorenz.py et un job
-    elicitation.py tournant EN MEME TEMPS sur le MEME n : dans ce cas
-    (comme pour _upsert_parquet), une course est possible mais reste
-    benigne -- au pire les deux recalculent la meme instance une fois
-    chacun (temps perdu), jamais de corruption de fichier, car
-    drop_duplicates(keep="last") retient juste l'une des deux lignes
-    identiques."""
-    return os.path.join(cache_dir, f"exact_cache_{w_type}_n{n}.parquet")
-
-
-def _exact_cache_lookup(w_type, n, seed, instance, cache_path):
-    """Retourne {"exact obj value": ..., "x": ...} si un resultat exact
-    existe deja dans le cache pour cette cle, sinon None."""
+    Default path of the exact cache, ONE FILE PER (w_type, n, k) -- k is
+    included in the filename as well as in the cache key, since two
+    different k values on the same n are unrelated problems and must
+    never be confused.
+    """
+    return os.path.join(cache_dir, f"exact_cache_{w_type}_n{n}_k{k}.parquet")
+ 
+ 
+def _exact_cache_lookup(w_type, n, k, seed, instance, cache_path):
+    """Returns {"exact obj value": ..., "x": ...} if an exact result
+    already exists in the cache for this key, else None."""
     if not os.path.exists(cache_path):
         return None
     try:
@@ -460,6 +424,7 @@ def _exact_cache_lookup(w_type, n, seed, instance, cache_path):
     mask = (
         (df["w_type"] == w_type)
         & (df["n"] == n)
+        & (df["k"] == k)
         & (df["seed"] == seed)
         & (df["instance"] == instance)
     )
@@ -468,45 +433,45 @@ def _exact_cache_lookup(w_type, n, seed, instance, cache_path):
         return None
     last = hit.iloc[-1]
     return {"exact obj value": last["exact_obj"], "x": last["exact_sol"]}
-
-
-def _exact_cache_store(w_type, n, seed, instance, obj_value, sol_vector, cache_path):
+ 
+ 
+def _exact_cache_store(w_type, n, k, seed, instance, obj_value, sol_vector, cache_path):
     row = {
         "w_type": w_type,
         "n": n,
+        "k": k,
         "seed": seed,
         "instance": instance,
         "exact_obj": obj_value,
         "exact_sol": np.asarray(sol_vector),
     }
     df_new = pd.DataFrame([row])
-
+ 
     cache_dir = os.path.dirname(cache_path)
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
-
+ 
     df_old = None
     if os.path.exists(cache_path):
         try:
             df_old = pd.read_parquet(cache_path)
         except Exception as e:
-            # Cache corrompu -- typiquement un job precedent tue par le
-            # walltime OAR en pleine ecriture, AVANT l'ecriture atomique
-            # ci-dessous. On ne plante pas : on met le fichier illisible
-            # de cote (pour investigation eventuelle) et on repart d'un
-            # cache ne contenant que la nouvelle ligne. Les anciennes
-            # entrees de ce fichier corrompu sont perdues, mais elles
-            # seront simplement recalculees au prochain passage puisque
-            # _exact_cache_lookup ne les trouvera plus.
+            # Corrupted cache -- typically a previous job killed by the
+            # OAR walltime mid-write, BEFORE the atomic write below. Do
+            # not crash: move the unreadable file aside (for later
+            # inspection) and start over with just the new row. Old
+            # entries from the corrupted file are lost, but will simply
+            # be recomputed next time since _exact_cache_lookup will no
+            # longer find them.
             backup_path = f"{cache_path}.corrupted.{int(time.time())}"
-            print(f"[WARNING] cache exact illisible ({e}) -- "
-                  f"sauvegarde dans {backup_path} et reinitialisation.")
+            print(f"[WARNING] unreadable exact cache ({e}) -- "
+                  f"moved to {backup_path} and reinitialised.")
             try:
                 os.replace(cache_path, backup_path)
             except OSError:
                 pass
             df_old = None
-
+ 
     if df_old is not None:
         df_combined = pd.concat([df_old, df_new], ignore_index=True)
         df_combined = (
@@ -517,75 +482,66 @@ def _exact_cache_store(w_type, n, seed, instance, obj_value, sol_vector, cache_p
         )
     else:
         df_combined = df_new
-
-    # Ecriture ATOMIQUE : on ecrit dans un fichier temporaire puis on le
-    # renomme par-dessus cache_path (os.replace est atomique sur un
-    # meme systeme de fichiers POSIX). Si CE processus est tue pendant
-    # le to_parquet, seul le fichier .tmp est incomplet -- cache_path
-    # lui-meme reste intact (l'ancienne version valide, ou absent si
-    # c'est la toute premiere ecriture). Ca elimine a la source le
-    # risque de cache corrompu par une coupure en cours d'ecriture.
+ 
+    # Atomic write: write to a temp file, then rename over cache_path
+    # (os.replace is atomic on the same POSIX filesystem). If THIS
+    # process is killed during to_parquet, only the .tmp file is
+    # incomplete -- cache_path itself stays intact.
     tmp_path = f"{cache_path}.tmp{os.getpid()}"
     df_combined.to_parquet(tmp_path, index=False)
     os.replace(tmp_path, cache_path)
-
-
-def has_cached_exact(w_type, n, seed, instance, cache_path):
-    """True si un resultat exact est deja present dans le cache pour
-    cette cle (w_type, n, seed, instance) -- permet de decider de
-    reutiliser le cache meme quand le budget de temps de la methode
-    'exact' est deja depasse (la reutilisation ne coute rien)."""
-    return _exact_cache_lookup(w_type, n, seed, instance, cache_path) is not None
-
-
+ 
+ 
+def has_cached_exact(w_type, n, k, seed, instance, cache_path):
+    """True if an exact result already exists in the cache for this key
+    (w_type, n, k, seed, instance) -- lets the caller reuse the cache
+    even when the 'exact' method's time budget is already exhausted
+    (reusing it costs nothing)."""
+    return _exact_cache_lookup(w_type, n, k, seed, instance, cache_path) is not None
+ 
+ 
 def _exact_cache_lock_path(cache_path):
     return cache_path + ".lock"
-
-
+ 
+ 
 def solve_exact_cached(cost_matrix, W, w_type, n, k, seed, instance, cache_path):
     """
-    Retourne (obj_value, sol_vector, elapsed, from_cache).
-
-    Si le resultat exact pour (w_type, n, seed, instance) est deja dans
-    le cache, il est reutilise tel quel (elapsed=0.0, from_cache=True) --
-    Gurobi n'est PAS relance. Sinon, affectation_1_1_solver est appele
-    normalement, le resultat est stocke dans le cache puis renvoye.
-
-    En cas d'echec du solveur (res is None, ex. limite de temps/memoire
-    Gurobi atteinte), rien n'est mis en cache et (None, None, elapsed,
-    False) est renvoye.
-
-    VERROUILLAGE : tout le bloc "verifier le cache -> calculer si absent
-    -> stocker" est protege par un verrou de fichier EXCLUSIF
-    (fcntl.flock, bloquant) sur cache_path + '.lock'. Sans ca, deux
-    processus qui demandent l'exact pour la MEME cle EN MEME TEMPS (ex.
-    deux valeurs de compute_X_method lancees en parallele avec le meme
-    w_type et le meme n) peuvent tous les deux trouver le cache vide et
-    lancer Gurobi chacun de leur cote -- pas de corruption de fichier
-    (drop_duplicates(keep='last') absorbe ca), mais le calcul est
-    effectivement fait deux fois, ce qui est exactement ce qu'on veut
-    eviter. Avec le verrou, le second processus attend que le premier
-    ait fini d'ecrire dans le cache, puis relit son resultat au lieu de
-    relancer le MILP.
-
-    ATTENTION : fcntl.flock suppose un verrouillage de fichiers
-    fonctionnel sur le systeme de fichiers partage entre les noeuds du
-    cluster (NFS avec lockd actif, ou systeme de fichiers local). Si vos
-    jobs OAR tournent sur des noeuds differents avec un NFS ou le
-    verrouillage est desactive/peu fiable, le verrou peut ne pas
-    empecher la course inter-noeuds (il reste efficace intra-noeud, et
-    dans le cas usuel ou un seul noeud heberge tous les sous-jobs d'un
-    meme n via 'core=4', cf. submit_array_oar.sh, ca couvre le cas
-    decrit ici).
+    Returns (obj_value, sol_vector, elapsed, from_cache).
+ 
+    If the exact result for (w_type, n, k, seed, instance) is already in
+    the cache, it is reused as-is (elapsed=0.0, from_cache=True) -- Gurobi
+    is NOT re-run. Otherwise kmowa_solver is called normally, the result
+    is stored in the cache, then returned.
+ 
+    If the solver fails (res is None, e.g. Gurobi hit a time/memory
+    limit), nothing is cached and (None, None, elapsed, False) is
+    returned.
+ 
+    LOCKING: the whole "check cache -> compute if missing -> store" block
+    is protected by an EXCLUSIVE file lock (fcntl.flock, blocking) on
+    cache_path + '.lock'. Without it, two processes requesting the exact
+    result for the SAME key AT THE SAME TIME could both find the cache
+    empty and both launch Gurobi -- no file corruption
+    (drop_duplicates(keep='last') absorbs that), but the computation
+    would effectively be done twice, exactly what this is meant to
+    avoid. With the lock, the second process waits for the first one to
+    finish writing to the cache, then reads its result back instead of
+    re-solving the MILP.
+ 
+    CAUTION: fcntl.flock assumes working file locking on the filesystem
+    shared between cluster nodes (NFS with lockd active, or a local
+    filesystem). If your OAR jobs run on different nodes with NFS
+    locking disabled/unreliable, the lock may not prevent a cross-node
+    race (it remains effective within a single node).
     """
     cache_dir = os.path.dirname(cache_path)
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
-
+ 
     lock_path = _exact_cache_lock_path(cache_path)
-
+ 
     with open(lock_path, "a+") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)  # bloquant : attend si un autre processus tient le verrou
+        fcntl.flock(lock_file, fcntl.LOCK_EX)  # blocking: waits if another process holds the lock
         try:
             cached = _exact_cache_lookup(w_type, n, k, seed, instance, cache_path)
             if cached is not None:
@@ -595,121 +551,277 @@ def solve_exact_cached(cost_matrix, W, w_type, n, k, seed, instance, cache_path)
                     0.0,
                     True,
                 )
-
+ 
             start = time.time()
             res = kmowa_solver(cost_matrix, k=k, W=W)
             elapsed = time.time() - start
-
+ 
             if res is None:
                 return None, None, elapsed, False
-
+ 
             obj_value = res["obj value"]
             sol_vector = _solution_to_vector(res["x"])
-            _exact_cache_store(w_type, n, seed, instance, obj_value, sol_vector, cache_path)
+            _exact_cache_store(w_type, n, k, seed, instance, obj_value, sol_vector, cache_path)
             return obj_value, sol_vector, elapsed, False
         finally:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
-
-
-
-
-    # -------------------------------------------------------------------
-# Main test function
+ 
+ 
 # -------------------------------------------------------------------
-
-
-def test_approx(
-    n: int,
-    k: int,
-    nb_instances: int,
-    method: str,
-    save: bool = True,
-    seed: int = 0,
-) -> pd.DataFrame:
+# Time budget (same permanent-stop design as elicitation.py's TimeBudget)
+# -------------------------------------------------------------------
+ 
+class TimeBudget:
+    """Tracks CUMULATIVE time per (method, n, k) and stops that method
+    for good once the cumulative time exceeds nb_instances * limit_seconds."""
+ 
+    def __init__(self, limit_seconds=1800.0, nb_instances=30):
+        self.limit = limit_seconds
+        self.nb_instances = nb_instances
+        self.total_time = {}
+        self.count = {}
+        self.stopped = set()
+ 
+    @property
+    def total_budget(self):
+        return self.limit * self.nb_instances
+ 
+    def should_run(self, method, n, k):
+        return (method, n, k) not in self.stopped
+ 
+    def is_stopped(self, method, n, k):
+        return (method, n, k) in self.stopped
+ 
+    def record(self, method, n, k, elapsed):
+        key = (method, n, k)
+        self.total_time[key] = self.total_time.get(key, 0.0) + elapsed
+        self.count[key] = self.count.get(key, 0) + 1
+        if self.total_time[key] > self.total_budget:
+            self.stopped.add(key)
+ 
+    def current_total(self, method, n, k):
+        return self.total_time.get((method, n, k), 0.0)
+ 
+ 
+# -------------------------------------------------------------------
+# Main comparison function: local_search_single_swap vs exact (kmowa_solver)
+# -------------------------------------------------------------------
+ 
+def run_one(cost_matrix, W, n, k, instance, seed, budget: TimeBudget, w_type,
+            methods=None, exact_cache_path=None, ls_epsilon=0.0, ls_init="greedy"):
     """
-    Run nb_instances assignment tests on random n x n cost matrices
-    and save results to a method-specific parquet file after each instance.
-
-    :param n: number of agents / objects
-    :param nb_instances: number of random instances to test
-    :param method: "exact"  -> computes exact solution only.
-                   "lorenz" -> computes approx solution (kfw.approx_from_lorenz)
-                               as well as the exact solution needed to compute
-                               the ratio at export time.
-    :param save: if True, upsert each instance result into the parquet file
-                 right after it is computed
-    :param seed: random seed for reproducibility
-    :return: DataFrame with one row per instance
+    Runs the requested methods on a single instance and returns one
+    result row. methods : subset of {'local_search', 'exact'}. None = both.
+ 
+    Note: local_search_single_swap optimizes the SUM objective (plain
+    k-median), not the OWA-weighted one. Its result is reported both as
+    its own (sum) objective, and re-evaluated under the OWA weights W via
+    owa_cost, for comparison with the 'exact' OWA-optimal value --
+    these two numbers answer different questions (see module docstring
+    of the local search section) and should not be confused.
     """
-    print(f"Weight type: {WEIGHTS_TYPE}; method: {method}; n: {n}")
-    if method not in ("lorenz", "exact", "approx_precomputed", "approx_weights"):
-        raise ValueError(f"method must be 'lorenz' or 'exact', got: {method}")
-
-    if save:
-        os.makedirs(RESULTS_DIR, exist_ok=True)
-
-    parquet_path = f"{RESULTS_DIR}/results_{method}_n{n}.parquet"
-
-    # Generate random instances with a reproducible seed
-    rng = np.random.default_rng(seed)
-
-    # Generate weights W based on the selected WEIGHTS_TYPE
-    if WEIGHTS_TYPE == "linear":
-        W = np.arange(1, n + 1)[::-1] / (n * (n + 1))
-
-    if WEIGHTS_TYPE.startswith("s_gini"): 
-        delta = float(WEIGHTS_TYPE.split("_")[2])
-        W = s_gini_weights(n, delta)
-
-    if WEIGHTS_TYPE == "sqrt":
-        W = np.ones(n)
-        W[0] = np.sqrt(n)
-
-
+    if methods is None:
+        methods = {"local_search", "exact"}
+ 
+    row = {"n": n, "k": k, "instance": instance, "seed": seed}
+ 
+    # --- local_search (plain k-median approximation, Arya et al.) ---
+    if "local_search" not in methods:
+        row["local_search_time"] = np.nan
+        row["local_search_sum_obj"] = np.nan
+        row["local_search_owa_obj"] = np.nan
+        row["local_search_nb_iters"] = np.nan
+    elif budget.should_run("local_search", n, k):
+        start = time.time()
+        S, sum_obj, nb_iters = local_search_single_swap(
+            cost_matrix, k, epsilon=ls_epsilon, init=ls_init, seed=seed
+        )
+        elapsed = time.time() - start
+        budget.record("local_search", n, k, elapsed)
+        row["local_search_time"] = elapsed
+        row["local_search_sum_obj"] = sum_obj
+        row["local_search_owa_obj"] = owa_cost(costs_from_open_facilities(cost_matrix, S), W)
+        row["local_search_nb_iters"] = nb_iters
+    else:
+        row["local_search_time"] = np.nan
+        row["local_search_sum_obj"] = np.nan
+        row["local_search_owa_obj"] = np.nan
+        row["local_search_nb_iters"] = np.nan
+ 
+    # --- exact (Gurobi, OWA-optimal, with shared cache) ---
+    if "exact" not in methods:
+        row["exact_time"] = np.nan
+        row["exact_owa_obj"] = np.nan
+    else:
+        cache_path = exact_cache_path or default_exact_cache_path(w_type, n, k)
+        if budget.should_run("exact", n, k) or has_cached_exact(w_type, n, k, seed, instance, cache_path):
+            obj_value, sol_vector, elapsed, from_cache = solve_exact_cached(
+                cost_matrix, W, w_type, n, k, seed, instance, cache_path
+            )
+            if not from_cache:
+                budget.record("exact", n, k, elapsed)
+            row["exact_time"] = 0.0 if from_cache else elapsed
+            row["exact_owa_obj"] = obj_value if obj_value is not None else np.nan
+        else:
+            row["exact_time"] = np.nan
+            row["exact_owa_obj"] = np.nan
+ 
+    # --- ratio (OWA objective, local_search vs exact) ---
+    if not np.isnan(row["exact_owa_obj"]) and row["exact_owa_obj"] > 0 and not np.isnan(row["local_search_owa_obj"]):
+        row["ratio_local_search"] = row["local_search_owa_obj"] / row["exact_owa_obj"]
+    else:
+        row["ratio_local_search"] = np.nan
+ 
+    return row
+ 
+ 
+def run_comparison(
+    n_values,
+    w_type,
+    k,
+    nb_instances=30,
+    seed=0,
+    time_limit=1800.0,
+    output_path=None,
+    instance_start=0,
+    instance_end=None,
+    methods=None,
+    exact_cache_dir="results",
+    ls_epsilon=0.0,
+    ls_init="greedy",
+):
+    """
+    Compares local_search_single_swap and kmowa_solver (exact) over a set
+    of metric k-median instances, one row per instance, upserted into a
+    parquet file after each instance (same pattern as
+    compare_min_lorenz.run_comparison).
+ 
+    Requires generate_instances_k_median.py (random_metric_costs,
+    get_weights) to generate instances with the triangle inequality and
+    OWA weights -- imported lazily below to avoid a hard dependency for
+    callers who only need the algorithms themselves.
+    """
+    from generate_instances_k_median import random_metric_costs, get_weights
+ 
+    instance_end = nb_instances if instance_end is None else instance_end
+    budget = TimeBudget(limit_seconds=time_limit, nb_instances=nb_instances)
+ 
+    if output_path is None:
+        output_path = f"results/kmedian_{w_type}_k{k}.parquet"
+ 
     rows = []
-    for i in range(nb_instances):
-        print("Instance:", i)
-
-        cost_matrix = rng.integers(1, 10**4, (n, n), dtype=int)
-
-        if method == "exact":
-            start = time.time()
-            res = kmowa_solver(cost_matrix, k, W)
-            elapsed = time.time() - start
-
-            row = {
-                "n": n,
-                "instance": i,
-                "seed": seed,
-                "exact sol": _solution_to_vector(res["x"]),
-                "exact obj value": res["obj value"],
-                "exact sol time": elapsed,
-            }
-
-      
-        elif method == "approx_precomputed":
-            start = time.time()
-            pre_sol, nb_sol = min_lorenz(cost_matrix, W)
-            sol = np.eye(n, dtype=int)[pre_sol]
-            obj_value = compute_obj_matrix(sol, cost_matrix, W)
-            res_approx_precomputed = {"x": sol, "obj value": obj_value}
-            elapsed = time.time() - start
-
-            row = {
-                "n": n,
-                "instance": i,
-                "seed": seed,
-                "approx pre sol": _solution_to_vector(res_approx_precomputed["x"]),
-                "approx pre obj value": res_approx_precomputed["obj value"],
-                "approx pre time": elapsed,
-                "approx pre nb sols": nb_sol,
-            }
-
-        rows.append(row)
-
-        if save:
-            _upsert_parquet(row, parquet_path)
-            print(f"[{method}] n={n}, instance {i+1}/{nb_instances} saved.")
-
+    for n in n_values:
+        cost_matrices = [random_metric_costs(n, seed=seed + i) for i in range(nb_instances)]
+        exact_cache_path = default_exact_cache_path(w_type, n, k, exact_cache_dir)
+        for i in range(instance_start, instance_end):
+            W = get_weights(w_type, n, i)
+            cost_matrix = cost_matrices[i]
+ 
+            skip_info = []
+            for method in ["local_search", "exact"]:
+                if budget.is_stopped(method, n, k):
+                    skip_info.append(
+                        f"{method} (cumul={budget.current_total(method, n, k):.0f}s "
+                        f"> budget={budget.total_budget:.0f}s)"
+                    )
+            skip_str = f" [STOPPED: {', '.join(skip_info)}]" if skip_info else ""
+ 
+            print(f"[running] n={n} k={k} instance={i} w_type={w_type}{skip_str}")
+ 
+            row = run_one(
+                cost_matrix, W, n, k, i, seed, budget, w_type,
+                methods=methods, exact_cache_path=exact_cache_path,
+                ls_epsilon=ls_epsilon, ls_init=ls_init,
+            )
+            row["w_type"] = w_type
+            rows.append(row)
+ 
+            _upsert_parquet(row, output_path)
+ 
+            def fmt(v):
+                return "  --  " if (v is None or (isinstance(v, float) and np.isnan(v))) else f"{v:.4f}"
+ 
+            print(f"  -> local_search: {fmt(row['local_search_time'])} (OWA obj {fmt(row['local_search_owa_obj'])})  "
+                  f"exact: {fmt(row['exact_time'])} (OWA obj {fmt(row['exact_owa_obj'])})  "
+                  f"ratio: {fmt(row['ratio_local_search'])}")
+ 
     return pd.DataFrame(rows)
-
+ 
+ 
+def print_comparison(df: pd.DataFrame):
+    pd.set_option("display.width", 160)
+ 
+    agg = df.groupby(["w_type", "n", "k"]).agg(
+        instances=("instance", "count"),
+        local_search_time=("local_search_time", "mean"),
+        exact_time=("exact_time", "mean"),
+        ratio_mean=("ratio_local_search", "mean"),
+        ratio_max=("ratio_local_search", "max"),
+        n_exact=("exact_owa_obj", lambda s: s.notna().sum()),
+        n_ls=("local_search_owa_obj", lambda s: s.notna().sum()),
+    ).reset_index()
+ 
+    for w_type in agg["w_type"].unique():
+        sub = agg[agg["w_type"] == w_type].sort_values(["k", "n"])
+        print(f"\n{'=' * 100}\n{w_type}\n{'=' * 100}")
+        print(f"{'n':>5} {'k':>5} {'inst':>5} | {'n_ls':>5} {'n_exact':>7} | "
+              f"{'t_ls':>9} {'t_exact':>9} | {'ratio':>10} {'max':>7}")
+        for _, r in sub.iterrows():
+            def fmt(v):
+                return "  --  " if np.isnan(v) else f"{v:.4f}"
+            print(f"{int(r.n):>5} {int(r.k):>5} {int(r.instances):>5} | "
+                  f"{int(r.n_ls):>5} {int(r.n_exact):>7} | "
+                  f"{fmt(r.local_search_time):>9} {fmt(r.exact_time):>9} | "
+                  f"{fmt(r.ratio_mean):>10} {fmt(r.ratio_max):>7}")
+ 
+    print(f"\n{'=' * 100}\n{len(df)} runs total")
+ 
+ 
+if __name__ == "__main__":
+    import argparse
+ 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n-values", type=int, nargs="+", default=[20, 30])
+    parser.add_argument("--k", type=int, required=True, help="number of facilities to open")
+    parser.add_argument("--w-type", default="s_gini_1.5_weights")
+    parser.add_argument("--nb-instances", type=int, default=30)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--time-limit", type=float, default=1800.0,
+                         help="average time budget (s) per (method, n, k) -- default 1800s.")
+    parser.add_argument("--methods", default=None,
+                         help="comma-separated subset of local_search,exact. Default: both.")
+    parser.add_argument("--instance-start", type=int, default=0)
+    parser.add_argument("--instance-end", type=int, default=None)
+    parser.add_argument("--output", default=None)
+    parser.add_argument("--exact-cache-dir", default="results")
+    parser.add_argument("--ls-epsilon", type=float, default=0.0,
+                         help="local_search_single_swap's epsilon (0 = naive, >0 = time-guaranteed).")
+    parser.add_argument("--ls-init", default="greedy", choices=["greedy", "random"])
+    args = parser.parse_args()
+ 
+    output_path = args.output
+    if output_path is None:
+        if args.instance_start != 0 or args.instance_end is not None:
+            end = args.instance_end if args.instance_end is not None else args.nb_instances
+            output_path = f"results/kmedian_{args.w_type}_k{args.k}_inst{args.instance_start}-{end}.parquet"
+        else:
+            output_path = f"results/kmedian_{args.w_type}_k{args.k}.parquet"
+ 
+    methods = set(args.methods.split(",")) if args.methods else None
+ 
+    df = run_comparison(
+        n_values=args.n_values,
+        w_type=args.w_type,
+        k=args.k,
+        nb_instances=args.nb_instances,
+        seed=args.seed,
+        time_limit=args.time_limit,
+        output_path=output_path,
+        instance_start=args.instance_start,
+        instance_end=args.instance_end,
+        methods=methods,
+        exact_cache_dir=args.exact_cache_dir,
+        ls_epsilon=args.ls_epsilon,
+        ls_init=args.ls_init,
+    )
+    print_comparison(df)
