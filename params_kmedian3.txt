@@ -1,12 +1,4 @@
-#150 8 exact
-#150 10 exact
-#200 2 exact
-#200 3 exact 
-200 5 exact
-200 8 exact
-200 10 exact
-300 2 exact
-300 3 exact 
-300 5 exact
-300 8 exact
-300 10 exact
+150 8 exact
+150 10 exact
+200 2 exact
+200 3 exact
