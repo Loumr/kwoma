@@ -201,51 +201,239 @@ def local_search_single_swap(
     return sorted(S.tolist()), cost_S, it
 
 
-# ---------------------------------------------------------------------
-# Computation of approximation solutions for the min-sum k-median problem
-# with a Local Search Algorithm for k-median (Arya et al., 2004)
-# for different modified cost matrices (thresholding): application of our 
-# approximation algorithm for the k-median problem with OWA weights.
-# ---------------------------------------------------------------------
+
+#####################################################################
+################ MIN-SUM K-MEDIAN : EXACT SOLVER (GUROBI) ###########
+#####################################################################
+
+def _gurobi_status_name(code):
+    """Readable name of a Gurobi status code (e.g. 2 -> 'OPTIMAL')."""
+    for name in dir(GRB.Status):
+        if not name.startswith("_") and getattr(GRB.Status, name) == code:
+            return name
+    return str(code)
 
 
-def min_sum_k_median(cost_matrix, k, W, epsilon=0.0, init="greedy", seed=0):
+def kmedian_minsum_solver(dist_matrix, k, time_limit=None, threads=4,
+                          mem_limit=None, start_S=None, verbose=False):
     """
-    Compute all assignments minimizing the min sum version of the problem
-    with modified cost matrices and returns the best one for the OWA objective.
+    Exact MILP for the classical (min-sum) k-median problem.
+
+    Convention (SAME as local_search_single_swap):
+        dist_matrix[i, j] = cost of serving CLIENT i from FACILITY j
+    (rectangular matrices are accepted).
+
+        min  sum_{i,j} d_ij x_ij
+        s.t. sum_j x_ij = 1      for every client i
+             x_ij <= y_j         for every (i, j)   (strong formulation)
+             sum_j y_j = k
+             y_j in {0,1},  0 <= x_ij <= 1
+
+    x is CONTINUOUS: once y is fixed, assigning each client to its nearest
+    open facility is optimal, so x is integral at the optimum anyway --
+    n_facilities binaries instead of n_clients * n_facilities.
+
+    :param time_limit: Gurobi TimeLimit (s), None = no limit.
+    :param start_S: optional MIP start (list of k facility indices). Do NOT
+        use it when measuring exact solve times (it biases them).
+    :return: dict, ALWAYS (never None):
+        status (str), optimal (bool), obj (float, NaN if no solution),
+        bound (best lower bound), gap, S (sorted list of open facilities
+        or None), solver_time (Gurobi Runtime), build_time, wall_time.
+        'obj' is RECOMPUTED from S with the same formula as the local
+        search, so the ratios ls/exact are not polluted by solver tolerances.
     """
+    D = np.asarray(dist_matrix, dtype=float)
+    n_clients, n_fac = D.shape
+    if not 1 <= k <= n_fac:
+        raise ValueError(f"k={k} must be in [1, {n_fac}]")
 
-    costs = cost_matrix.copy()
-    n = np.shape(costs)[0]
+    t0 = time.perf_counter()
+    params = {"OutputFlag": 1 if verbose else 0, "Threads": threads}
+    if time_limit is not None:
+        params["TimeLimit"] = float(time_limit)
+    if mem_limit is not None:
+        params["MemLimit"] = mem_limit
 
-    # Compute the solution minimizing the sum of the costs per agent with costs costs
-    S, _, _ = local_search_single_swap(costs, k, epsilon=epsilon, init=init, seed=seed)
-    # Compute the corresponding OWA cost for this solution
-    cost_vect = costs_from_open_facilities(costs, S)
-    owa_obj = owa_cost(cost_vect, W)
+    # Context managers: model AND environment are disposed even if an
+    # exception is raised (no more m.dispose() / gc.collect() by hand).
+    with gp.Env(params=params) as env, gp.Model("min-sum k-median", env=env) as m:
+        y = m.addMVar(n_fac, vtype=GRB.BINARY, name="y")
+        x = m.addMVar((n_clients, n_fac), lb=0.0, ub=1.0, name="x")
 
-    unique_solutions = set()
-    unique_solutions.add(tuple(S))
+        m.addConstr(x.sum(axis=1) == 1, name="assign")
+        m.addConstr(x <= y, name="open")          # broadcast over the rows of x
+        m.addConstr(y.sum() == k, name="k_facilities")
+        m.setObjective((x * D).sum(), GRB.MINIMIZE)
 
-    for t in np.unique(costs)[1::]:
-        # Compute the temporary cost matrix where costs smaller than t are replaced by t
-        temp_costs_t = np.maximum(costs, t)
+        if start_S is not None:
+            y.Start = np.isin(np.arange(n_fac), list(start_S)).astype(float)
 
-        # Compute solution minimizing the sum of the costs per agent with costs temp_costs_t
-        S_t, _, _ = local_search_single_swap(temp_costs_t, k, epsilon=epsilon, init=init, seed=seed)
-        # Compute the corresponding OWA cost for this solution
-        cost_vect_t = costs_from_open_facilities(costs, S_t)
-        owa_obj_t = owa_cost(cost_vect_t, W)
+        build_time = time.perf_counter() - t0
+        m.optimize()
 
-        # Keep unique cost vectors
-        unique_solutions.add(tuple(S_t))
-    
-        if owa_obj_t < owa_obj:
-            S = S_t
-            owa_obj = owa_obj_t
+        status = _gurobi_status_name(m.Status)
+        optimal = m.Status == GRB.OPTIMAL
+        S, obj = None, np.nan
+        if m.SolCount > 0:
+            S = sorted(np.flatnonzero(y.X > 0.5).tolist())
+            obj = float(D[:, S].min(axis=1).sum())
+        bound = float(m.ObjBound) if m.SolCount > 0 or optimal else np.nan
+        gap = float(m.MIPGap) if m.SolCount > 0 else np.nan
+        solver_time = float(m.Runtime)
 
-    return S, len(unique_solutions)
+    return {
+        "status": status,
+        "optimal": bool(optimal),
+        "obj": obj,
+        "bound": bound,
+        "gap": gap,
+        "S": S,
+        "solver_time": solver_time,
+        "build_time": build_time,
+        "wall_time": time.perf_counter() - t0,
+    }
 
+
+def kmedian_minsum_bruteforce(dist_matrix, k):
+    """Enumerates every set of k facilities. ONLY for tests (n <= ~15)."""
+    from itertools import combinations
+    D = np.asarray(dist_matrix, dtype=float)
+    best_S, best = None, np.inf
+    for S in combinations(range(D.shape[1]), k):
+        c = D[:, S].min(axis=1).sum()
+        if c < best:
+            best, best_S = c, list(S)
+    return best_S, float(best)
+
+
+def self_test_minsum(nb_tests=20, n_max=10, seed=0):
+    """
+    Sanity check: kmedian_minsum_solver == brute force, and
+    local_search_single_swap >= optimum, on small random metric instances.
+    Run it once (python3 kmowa.py --self-test) before launching the cluster jobs.
+    """
+    rng = np.random.default_rng(seed)
+    for t in range(nb_tests):
+        n = int(rng.integers(4, n_max + 1))
+        k = int(rng.integers(1, n))
+        P = rng.uniform(0, 100, size=(n, 2))
+        D = np.sqrt(((P[:, None, :] - P[None, :, :]) ** 2).sum(-1))
+        _, bf = kmedian_minsum_bruteforce(D, k)
+        res = kmedian_minsum_solver(D, k, threads=1)
+        _, ls, _ = local_search_single_swap(D, k)
+        assert res["optimal"] and abs(res["obj"] - bf) <= 1e-6 * max(1.0, bf), (t, n, k, res, bf)
+        assert ls >= bf - 1e-6 * max(1.0, bf), (t, n, k, ls, bf)
+    print(f"[self-test] OK: {nb_tests} instances, exact == brute force, LS >= optimum.")
+
+
+#####################################################################
+############## MIN-SUM K-MEDIAN : CACHE OF EXACT RESULTS ############
+#####################################################################
+
+def _atomic_to_parquet(df, path):
+    """Writes df to path atomically (temp file + os.replace): a job killed
+    by the OAR walltime mid-write can no longer leave a corrupted file."""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp_path = f"{path}.tmp{os.getpid()}"
+    df.to_parquet(tmp_path, index=False)
+    os.replace(tmp_path, path)
+
+
+# The min-sum problem does NOT depend on the OWA weights: no w_type in the
+# key nor in the file name (the instances are generated independently of
+# w_type anyway, see random_metric_costs(n, seed=seed + i)).
+MINSUM_CACHE_KEY_COLS = ["n", "k", "seed", "instance"]
+
+
+def default_minsum_cache_path(n, k, cache_dir="results"):
+    return os.path.join(cache_dir, f"exact_minsum_cache_n{n}_k{k}.parquet")
+
+
+def _minsum_cache_lookup(n, k, seed, instance, cache_path, time_limit=None):
+    """
+    Returns the cached exact result (dict) or None. A NON-optimal cached
+    result (time limit reached) is only reused if it was obtained with a
+    time limit >= the current one -- otherwise we retry with the larger
+    budget.
+    """
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        df = pd.read_parquet(cache_path)
+    except Exception:
+        return None
+    hit = df[(df["n"] == n) & (df["k"] == k) & (df["seed"] == seed) & (df["instance"] == instance)]
+    if hit.empty:
+        return None
+    r = hit.iloc[-1].to_dict()
+    if not r["optimal"]:
+        cached_tl = r.get("time_limit")
+        cached_tl = np.inf if _is_missing(cached_tl) else cached_tl
+        wanted_tl = np.inf if time_limit is None else time_limit
+        if cached_tl < wanted_tl:
+            return None
+    if r.get("S") is not None and not _is_missing(r.get("S")):
+        r["S"] = [int(s) for s in r["S"]]
+    return r
+
+
+def _minsum_cache_store(n, k, seed, instance, res, time_limit, cache_path):
+    row = {
+        "n": n, "k": k, "seed": seed, "instance": instance,
+        "obj": res["obj"], "bound": res["bound"], "gap": res["gap"],
+        "optimal": res["optimal"], "status": res["status"],
+        "S": res["S"],
+        "solver_time": res["solver_time"], "build_time": res["build_time"],
+        "wall_time": res["wall_time"],
+        "time_limit": np.nan if time_limit is None else float(time_limit),
+    }
+    df_new = pd.DataFrame([row])
+    df_old = None
+    if os.path.exists(cache_path):
+        try:
+            df_old = pd.read_parquet(cache_path)
+        except Exception as e:
+            backup = f"{cache_path}.corrupted.{int(time.time())}"
+            print(f"[WARNING] unreadable min-sum cache ({e}) -- moved to {backup}.")
+            try:
+                os.replace(cache_path, backup)
+            except OSError:
+                pass
+    if df_old is not None:
+        df_new = (pd.concat([df_old, df_new], ignore_index=True)
+                  .drop_duplicates(subset=MINSUM_CACHE_KEY_COLS, keep="last")
+                  .sort_values(MINSUM_CACHE_KEY_COLS)
+                  .reset_index(drop=True))
+    _atomic_to_parquet(df_new, cache_path)
+
+
+def solve_minsum_exact_cached(cost_matrix, n, k, seed, instance, cache_path,
+                              time_limit=None, threads=4):
+    """
+    Returns (res, from_cache). res has the keys of kmedian_minsum_solver.
+    The solve times stored in the cache are the ORIGINAL ones: reading the
+    cache gives back the real Gurobi time, not 0 (otherwise every average
+    time would be biased downwards as soon as a result comes from cache).
+    Same exclusive flock as solve_exact_cached (no double Gurobi run when
+    two jobs ask for the same key at the same time).
+    """
+    d = os.path.dirname(cache_path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(cache_path + ".lock", "a+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            cached = _minsum_cache_lookup(n, k, seed, instance, cache_path, time_limit)
+            if cached is not None:
+                return cached, True
+            res = kmedian_minsum_solver(cost_matrix, k, time_limit=time_limit, threads=threads)
+            _minsum_cache_store(n, k, seed, instance, res, time_limit, cache_path)
+            return res, False
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 
@@ -283,18 +471,18 @@ def kmowa_solver(cost_matrix, k, W):
     # Add constraints
     # Constraints
     for j in range(n):
-        m.addConstr(z[j] == gp.quicksum(costs[i, j] * x[i, j] for i in range(n)), name=f"linearization_z_{j}")
+        m.addConstr(z[j] == gp.quicksum(costs[j, i] * x[j, i] for i in range(n)), name=f"linearization_z_{j}")
 
     for i in range(n):
         for j in range(n):
             m.addConstr(alpha[i] + beta[j] - W[j] * z[i] >= 0)
 
     for j in range(n):
-        m.addConstr(gp.quicksum(x[i, j] for i in range(n)) == 1, name=f"cover_{j}")
+        m.addConstr(gp.quicksum(x[j, i] for i in range(n)) == 1, name=f"cover_{j}")
 
     for i in range(n):
         for j in range(n):
-            m.addConstr(x[i, j] <= y[i], name=f"open_{i}_{j}")
+            m.addConstr(x[j, i] <= y[i], name=f"open_city_{j}_only_if_{i}")
 
     m.addConstr(gp.quicksum(y[i] for i in range(n)) <= k, name="k_facilities")
 
