@@ -219,15 +219,15 @@ def kmedian_minsum_solver(dist_matrix, k, time_limit=None, threads=4,
     """
     Exact MILP for the classical (min-sum) k-median problem.
 
-    Convention (SAME as local_search_single_swap):
-        dist_matrix[i, j] = cost of serving CLIENT i from FACILITY j
-    (rectangular matrices are accepted).
+    Notation (same as kmowa_solver): j = cities, i = facilities.
+        dist_matrix[j, i] = cost of serving CITY j from FACILITY i
+    (rows = cities, columns = facilities; rectangular matrices accepted).
 
-        min  sum_{i,j} d_ij x_ij
-        s.t. sum_j x_ij = 1      for every client i
-             x_ij <= y_j         for every (i, j)   (strong formulation)
-             sum_j y_j = k
-             y_j in {0,1},  0 <= x_ij <= 1
+        min  sum_{j,i} d_ji x_ji
+        s.t. sum_i x_ji = 1      for every city j
+             x_ji <= y_i         for every (j, i)   (strong formulation)
+             sum_i y_i = k
+             y_i in {0,1},  0 <= x_ji <= 1
 
     x is CONTINUOUS: once y is fixed, assigning each client to its nearest
     open facility is optimal, so x is integral at the optimum anyway --
