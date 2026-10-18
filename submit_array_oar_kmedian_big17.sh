@@ -57,7 +57,7 @@
 N=$1
 K=$2
 METHODS=${3:-"min_sum_k_mdeian,exact"}
-W_TYPE="s_gini_1.5_weights"
+W_TYPE="linear_weights"
 EPSILON_VALUES="0.1 0.01 0.001 0.0"   # liste separee par des espaces, passee telle quelle a --epsilon-values
 
 if [ -z "$N" ] || [ -z "$K" ]; then

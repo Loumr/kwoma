@@ -39,9 +39,9 @@
 # sous-jobs de tourner en parallele sur le meme hote.
 #
 # Soumission (un sous-job par ligne de params_kmedian.txt) :
-#   chmod +x submit_array_oar_kmedian_big18.sh
+#   chmod +x submit_array_oar_kmedian_big17.sh
 #   mkdir -p results logs
-#   oarsub -S ./submit_array_oar_kmedian_big18.sh --array-param-file params_kmedian.txt
+#   oarsub -S ./submit_array_oar_kmedian_big17.sh --array-param-file params_kmedian.txt
 #
 # Suivi :
 #   oarstat -u $USER
@@ -56,13 +56,13 @@
 
 N=$1
 K=$2
-METHODS=${3:-"min_sum_k_median,exact"}
-W_TYPE="s_gini_1.5_weights"
-EPSILON_VALUES="0.0 0.3 0.6"   # liste separee par des espaces, passee telle quelle a --epsilon-values
+METHODS=${3:-"min_sum_k_mdeian,exact"}
+W_TYPE="linear_weights"
+EPSILON_VALUES="0.1 0.01 0.001 0.0"   # liste separee par des espaces, passee telle quelle a --epsilon-values
 
 if [ -z "$N" ] || [ -z "$K" ]; then
     echo "Usage : $0 n k [methods]" >&2
-    echo "  methods : min_sum_k_median | exact | min_sum_k_median,exact (defaut)" >&2
+    echo "  methods : min_sum | exact | min_sum,exact (defaut)" >&2
     exit 1
 fi
 
@@ -78,17 +78,21 @@ for m in "${METHOD_LIST[@]}"; do
 done
 METHODS_LABEL=$(echo "$METHODS" | tr ',' '_')
 
+if [ "$METHODS" = "exact" ]; then
+    EPSILON_VALUES="0.0"
+fi
+
 # Activate your Python virtual environment
 source ~/venvs/gurobi-135/bin/activate
 
 # Set gurobi variables (verifier que ce .lic correspond bien a l'hote
-# cible ci-dessus dans la ligne #OAR -- big18)
+# cible ci-dessus dans la ligne #OAR -- big17)
 export GUROBI_HOME=$HOME/gurobi/gurobi1300/linux64
 export PATH=$GUROBI_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$GUROBI_HOME/lib:$LD_LIBRARY_PATH
 export GRB_LICENSE_FILE=$HOME/gurobi_licenses/big18.lic
 
-mkdir -p results logs
+mkdir -p ../results logs
 
 # Fichier de sortie DEDIE par (n, k, w_type, methods) -- aucun conflit
 # entre sous-jobs paralleles, y compris entre un job 'exact' et un job
