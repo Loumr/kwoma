@@ -494,15 +494,23 @@ def kmowa_solver(cost_matrix, k, W):
 
     if m.Status in [GRB.TIME_LIMIT, GRB.INTERRUPTED]:
         print("Time or memory limit reached.")
-        return None
+        return {"obj value" : None,
+            "x" : None,    
+            "y" : None,
+            "z" : None
+            }
 
     if m.Status != GRB.OPTIMAL:
         print("not optimal")
-        return None
+        return {"obj value" : None,
+            "x" : None,    
+            "y" : None,
+            "z" : None
+            }
 
     obj = m.ObjVal
-    x_sol = x.X.reshape((n, n)).astype(int)
-    y_sol = y.X.astype(int)
+    x_sol = np.rint(x.X).reshape((n, n)).astype(int)  # rint: binaries may come back as 0.9999999
+    y_sol = np.rint(y.X).astype(int)
     z_sol = z.X.astype(np.float64)
     
     m.dispose()
@@ -516,6 +524,130 @@ def kmowa_solver(cost_matrix, k, W):
             }
 
 
+
+
+# ---------------------------------------------------------------------
+# OWA k-median heuristic by thresholding: k-median counterpart of
+# k_fowama.min_lorenz ("lifted") and k_fowama.min_lorenz_v2 ("excess").
+# ---------------------------------------------------------------------
+
+# Cost transformations applied for each threshold t.
+_COST_TRANSFORMS = {
+    # costs below t are raised to t (as in k_fowama.min_lorenz)
+    "lifted": lambda costs, t: np.maximum(costs, t),
+    # only the part of each cost above t is counted (as in k_fowama.min_lorenz_v2)
+    "excess": lambda costs, t: np.maximum(costs - t, 0.0),
+}
+
+
+def solution_from_open_facilities(cost_matrix, S):
+    """
+    Builds the full solution (x, y, z) from a set S of open facilities,
+    each client being assigned to its nearest open facility for the
+    ORIGINAL costs (never the transformed ones: transformations create
+    ties, and argmin would then pick an arbitrary facility).
+    :param cost_matrix: (n, m) cost matrix (rows = clients, columns = facilities).
+    :param S: indices of the open facilities.
+    :return: x (n, m) 0/1 assignment matrix, y (m,) 0/1 opening vector,
+        z (n,) per-client costs.
+    """
+    costs = np.asarray(cost_matrix)
+    S = np.asarray(S, dtype=int)
+    n, m = costs.shape
+    rows = np.arange(n)
+    nearest = S[np.argmin(costs[:, S], axis=1)]
+    x = np.zeros((n, m), dtype=int)
+    x[rows, nearest] = 1
+    y = np.zeros(m, dtype=int)
+    y[S] = 1
+    z = costs[rows, nearest]
+    return x, y, z
+
+
+def min_sum_k_median(cost_matrix, k, W, epsilon=0.0, min_sum_method="ls", init="greedy",
+                     transform="lifted", seed=0, time_limit=None, early_stop=False):
+    """
+    Heuristic for the OWA k-median problem by thresholding.
+
+    For every distinct cost value t, a min-sum k-median problem is solved
+    on a transformed cost matrix (see _COST_TRANSFORMS), and the set of
+    open facilities is evaluated with the TRUE OWA objective (original
+    costs). The best one is kept. The first iteration uses the original
+    costs, i.e. it is the plain min-sum k-median.
+
+    :param cost_matrix: (n, m) cost matrix (rows = clients, columns = facilities).
+    :param k: number of facilities to open.
+    :param W: OWA weight vector of length n.
+    :param epsilon: local search threshold (0 = naive, >0 = polynomial time,
+        ratio 5/(1-epsilon)). Ignored if min_sum_method="exact".
+    :param min_sum_method: "ls" (local search of Arya et al.) or "exact"
+        (min-sum MILP, kmedian_minsum_solver).
+    :param init: "greedy" or "random" (local search only).
+    :param transform: "lifted" (max(c, t)) or "excess" (max(c - t, 0)).
+    :param seed: seed for init="random" (ignored otherwise).
+    :param time_limit: Gurobi time limit (s) for EACH min-sum MILP
+        (min_sum_method="exact" only), None = no limit.
+    :param early_stop: if True, stop as soon as the current solution
+        serves every client at a cost <= t. That solution is then optimal
+        for every larger threshold, so the remaining min-sum problems are
+        mostly redundant -- but the solver may still return a DIFFERENT
+        optimal set for them, so results can (rarely) differ from
+        early_stop=False. Default False = same results as before.
+    :return: dict {"obj value", "x", "y", "z", "S", "nb_sols", "nb_failed"}:
+        S = sorted list of open facilities, nb_sols = number of DISTINCT
+        sets S evaluated, nb_failed = number of min-sum problems without
+        a solution (exact solver only). If no min-sum problem was solved,
+        "obj value", "x", "y", "z" and "S" are None.
+    """
+    costs = np.asarray(cost_matrix, dtype=float)
+
+    if transform not in _COST_TRANSFORMS:
+        raise ValueError(f"unknown transform {transform!r}, expected one of {list(_COST_TRANSFORMS)}")
+    transform_costs = _COST_TRANSFORMS[transform]
+
+    # solve_min_sum(C) -> list of open facilities for the min-sum problem on C, or None
+    if min_sum_method == "ls":
+        def solve_min_sum(C):
+            S, _, _ = local_search_single_swap(C, k, epsilon=epsilon, init=init, seed=seed)
+            return S
+    elif min_sum_method == "exact":
+        def solve_min_sum(C):
+            return kmedian_minsum_solver(C, k, time_limit=time_limit)["S"]  # None if no solution
+    else:
+        raise ValueError(f"unknown min_sum_method {min_sum_method!r}, expected 'ls' or 'exact'")
+
+    best_S, best_obj = None, np.inf
+    seen = set()      # distinct sets of open facilities already evaluated
+    nb_failed = 0
+
+    for idx, t in enumerate(np.unique(costs)):
+        # idx == 0: original costs (plain min-sum k-median)
+        C_t = costs if idx == 0 else transform_costs(costs, t)
+
+        S = solve_min_sum(C_t)
+        if S is None:
+            nb_failed += 1
+            continue
+
+        S = tuple(sorted(int(i) for i in S))
+        z = costs_from_open_facilities(costs, S)
+
+        if S not in seen:
+            seen.add(S)
+            obj = owa_cost(z, W)
+            if obj < best_obj:
+                best_S, best_obj = S, obj
+
+        if early_stop and z.max() <= t:
+            break
+
+    if best_S is None:
+        return {"obj value": None, "x": None, "y": None, "z": None, "S": None,
+                "nb_sols": 0, "nb_failed": nb_failed}
+
+    x, y, z = solution_from_open_facilities(costs, best_S)
+    return {"obj value": best_obj, "x": x, "y": y, "z": z, "S": list(best_S),
+            "nb_sols": len(seen), "nb_failed": nb_failed}
 
 
 
@@ -608,6 +740,16 @@ def default_exact_cache_path(w_type, n, k, cache_dir="results"):
     return os.path.join(cache_dir, f"exact_cache_{w_type}_n{n}_k{k}.parquet")
  
  
+def _open_facilities_from_cached(sol):
+    """
+    Sorted list of open facilities from a cached exact solution. Works
+    for the new format (list S of open facilities) AND for the old one
+    (assignment vector of length n, facility of each client): in both
+    cases the open (used) facilities are its distinct values.
+    """
+    return sorted(np.unique(np.ravel(np.asarray(sol))).astype(int).tolist())
+ 
+ 
 def _exact_cache_lookup(w_type, n, k, seed, instance, cache_path):
     """Returns {"exact obj value": ..., "x": ...} if an exact result
     already exists in the cache for this key, else None."""
@@ -630,10 +772,16 @@ def _exact_cache_lookup(w_type, n, k, seed, instance, cache_path):
     if hit.empty:
         return None
     last = hit.iloc[-1]
-    return {"exact obj value": last["exact_obj"], "x": last["exact_sol"]}
+    if _is_missing(last["exact_obj"]):
+        return None  # failed solve stored by mistake: recompute it
+    # exact_time is absent from caches written by older versions -> NaN (unknown)
+    t = last["exact_time"] if "exact_time" in last.index else np.nan
+    return {"exact obj value": last["exact_obj"], "x": last["exact_sol"],
+            "time": np.nan if _is_missing(t) else float(t)}
  
  
-def _exact_cache_store(w_type, n, k, seed, instance, obj_value, sol_vector, cache_path):
+def _exact_cache_store(w_type, n, k, seed, instance, obj_value, sol_vector, cache_path,
+                       exact_time=np.nan):
     row = {
         "w_type": w_type,
         "n": n,
@@ -642,6 +790,7 @@ def _exact_cache_store(w_type, n, k, seed, instance, obj_value, sol_vector, cach
         "instance": instance,
         "exact_obj": obj_value,
         "exact_sol": np.asarray(sol_vector),
+        "exact_time": exact_time,  # time of the ORIGINAL solve, reused on cache hits
     }
     df_new = pd.DataFrame([row])
  
@@ -704,14 +853,15 @@ def _exact_cache_lock_path(cache_path):
  
 def solve_exact_cached(cost_matrix, W, w_type, n, k, seed, instance, cache_path):
     """
-    Returns (obj_value, sol_vector, elapsed, from_cache).
+    Returns (obj_value, S, elapsed, from_cache), S = sorted list of open facilities.
  
     If the exact result for (w_type, n, k, seed, instance) is already in
-    the cache, it is reused as-is (elapsed=0.0, from_cache=True) -- Gurobi
+    the cache, it is reused as-is (from_cache=True, elapsed = time of the
+    original solve as stored in the cache, NaN for old caches) -- Gurobi
     is NOT re-run. Otherwise kmowa_solver is called normally, the result
     is stored in the cache, then returned.
  
-    If the solver fails (res is None, e.g. Gurobi hit a time/memory
+    If the solver fails (res["obj value"] is None, e.g. Gurobi hit a time/memory
     limit), nothing is cached and (None, None, elapsed, False) is
     returned.
  
@@ -745,8 +895,8 @@ def solve_exact_cached(cost_matrix, W, w_type, n, k, seed, instance, cache_path)
             if cached is not None:
                 return (
                     cached["exact obj value"],
-                    _solution_to_vector(cached["x"]),
-                    0.0,
+                    _open_facilities_from_cached(cached["x"]),
+                    cached["time"],
                     True,
                 )
  
@@ -754,13 +904,15 @@ def solve_exact_cached(cost_matrix, W, w_type, n, k, seed, instance, cache_path)
             res = kmowa_solver(cost_matrix, k=k, W=W)
             elapsed = time.time() - start
  
-            if res is None:
-                return None, None, elapsed, False
+            if res is None or res["obj value"] is None:
+                return None, None, elapsed, False  # nothing cached
  
             obj_value = res["obj value"]
-            sol_vector = _solution_to_vector(res["x"])
-            _exact_cache_store(w_type, n, k, seed, instance, obj_value, sol_vector, cache_path)
-            return obj_value, sol_vector, elapsed, False
+            S = np.flatnonzero(res["y"] > 0.5).tolist()
+ 
+            _exact_cache_store(w_type, n, k, seed, instance, obj_value, S, cache_path,
+                               exact_time=elapsed)
+            return obj_value, S, elapsed, False
         finally:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
  
@@ -829,37 +981,45 @@ def run_one(cost_matrix, W, n, k, instance, seed, budget: TimeBudget, w_type,
         row["min_sum_k_median_time"] = np.nan
         row["min_sum_k_median_owa_obj"] = np.nan
         row["min_sum_k_median_nb_sols"] = np.nan
+        row["min_sum_k_median_S"] = np.nan
     elif budget.should_run("min_sum_k_median", n, k):
         start = time.time()
-        S, nb_sols = min_sum_k_median(cost_matrix, k, W, epsilon=ls_epsilon, init=ls_init, seed=seed)
+        res = min_sum_k_median(cost_matrix, k, W, epsilon=ls_epsilon, min_sum_method="ls", init=ls_init, seed=seed)
         elapsed = time.time() - start
         budget.record("min_sum_k_median", n, k, elapsed)
-        costs_S = costs_from_open_facilities(cost_matrix, S)
         row["min_sum_k_median_time"] = elapsed
-        row["min_sum_k_median_owa_obj"] = owa_cost(costs_S, W)
-        row["min_sum_k_median_nb_sols"] = nb_sols
+        row["min_sum_k_median_owa_obj"] = res["obj value"] if res["obj value"] is not None else np.nan
+        row["min_sum_k_median_S"] = res["S"] if res["S"] is not None else np.nan
+        row["min_sum_k_median_nb_sols"] = res["nb_sols"]
     else:
         row["min_sum_k_median_time"] = np.nan
         row["min_sum_k_median_owa_obj"] = np.nan
+        row["min_sum_k_median_S"] = np.nan
         row["min_sum_k_median_nb_sols"] = np.nan
  
     # --- exact (Gurobi, OWA-optimal, with shared cache) ---
     if "exact" not in methods:
         row["exact_time"] = np.nan
         row["exact_owa_obj"] = np.nan
+        row["exact_S"] = np.nan
+        row["exact_from_cache"] = np.nan
     else:
         cache_path = exact_cache_path or default_exact_cache_path(w_type, n, k)
         if budget.should_run("exact", n, k) or has_cached_exact(w_type, n, k, seed, instance, cache_path):
-            obj_value, sol_vector, elapsed, from_cache = solve_exact_cached(
+            obj_value, S, elapsed, from_cache = solve_exact_cached(
                 cost_matrix, W, w_type, n, k, seed, instance, cache_path
             )
             if not from_cache:
                 budget.record("exact", n, k, elapsed)
-            row["exact_time"] = 0.0 if from_cache else elapsed
+            row["exact_time"] = elapsed  # original solve time, also on cache hits
+            row["exact_from_cache"] = from_cache
             row["exact_owa_obj"] = obj_value if obj_value is not None else np.nan
+            row["exact_S"] = S if S is not None else np.nan
         else:
             row["exact_time"] = np.nan
             row["exact_owa_obj"] = np.nan
+            row["exact_S"] = np.nan
+            row["exact_from_cache"] = np.nan
  
     # --- ratio (OWA objective, min_sum_k_median vs exact) ---
     if not np.isnan(row["exact_owa_obj"]) and row["exact_owa_obj"] > 0 and not np.isnan(row["min_sum_k_median_owa_obj"]):

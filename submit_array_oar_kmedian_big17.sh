@@ -56,9 +56,9 @@
 
 N=$1
 K=$2
-METHODS=${3:-"min_sum,exact"}
+METHODS=${3:-"min_sum_k_mdeian,exact"}
 W_TYPE="s_gini_1.5_weights"
-EPSILON_VALUES="0.1 0.01 0.001"   # liste separee par des espaces, passee telle quelle a --epsilon-values
+EPSILON_VALUES="0.1 0.01 0.001 0.0"   # liste separee par des espaces, passee telle quelle a --epsilon-values
 
 if [ -z "$N" ] || [ -z "$K" ]; then
     echo "Usage : $0 n k [methods]" >&2
@@ -72,11 +72,15 @@ fi
 IFS=',' read -ra METHOD_LIST <<< "$METHODS"
 for m in "${METHOD_LIST[@]}"; do
     case "$m" in
-        min_sum|exact) ;;
-        *) echo "Methode invalide : '$m' (min_sum | exact)" >&2; exit 1 ;;
+        min_sum_k_median|exact) ;;
+        *) echo "Methode invalide : '$m' (min_sum_k_median | exact)" >&2; exit 1 ;;
     esac
 done
 METHODS_LABEL=$(echo "$METHODS" | tr ',' '_')
+
+if [ "$METHODS" = "exact" ]; then
+    EPSILON_VALUES="0.0"
+fi
 
 # Activate your Python virtual environment
 source ~/venvs/gurobi-135/bin/activate
@@ -88,7 +92,7 @@ export PATH=$GUROBI_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$GUROBI_HOME/lib:$LD_LIBRARY_PATH
 export GRB_LICENSE_FILE=$HOME/gurobi_licenses/big17.lic
 
-mkdir -p results logs
+mkdir -p ../results logs
 
 # Fichier de sortie DEDIE par (n, k, w_type, methods) -- aucun conflit
 # entre sous-jobs paralleles, y compris entre un job 'exact' et un job

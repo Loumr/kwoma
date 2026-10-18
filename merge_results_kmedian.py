@@ -1,118 +1,156 @@
 """
 merge_results_kmedian.py
 
-Merges all parquet files produced by kmowa.py's parallel OAR jobs (one
-file per (n, k, methods) by default -- see submit_array_oar_kmedian_*.sh)
-into a single results file.
+Fusionne les fichiers parquet produits par les jobs paralleles de
+kmowa.py (un fichier par (w_type, n, k, methods), cf.
+submit_array_oar_kmedian_big17.sh) en un seul fichier de resultats.
 
-UNLIKE merge_results.py / merge_results_elicitation.py, this does NOT
-simply keep the last row per key: 'exact' and 'min_sum_k_median' can be
-run in SEPARATE jobs (so you don't launch both at once -- see
-submit_array_oar_kmedian_*.sh's METHODS parameter), each writing its own
-file with the OTHER method's columns left as NaN for the same
-(w_type, n, k, epsilon, seed, instance) key. A plain "keep last" merge
-would silently erase one method's results with the other's NaNs whenever
-both files are merged together. Instead, for each key, every column is
-combined by taking the last NON-NULL value found across all matching
-rows -- so an 'exact'-only row and a 'min_sum_k_median'-only row for the
-same key are merged into ONE row with both sets of columns filled in.
+Pourquoi pas un simple concat + drop_duplicates : un job 'exact' et un
+job 'min_sum_k_median' sur le meme (n, k) ecrivent chacun des lignes
+completes, ou les colonnes de l'AUTRE methode sont a NaN. Dedupliquer
+les lignes ecraserait les resultats d'une methode avec les NaN de
+l'autre. On reconstruit donc les deux blocs de colonnes separement :
 
-epsilon has no effect on 'exact' (kmowa_solver doesn't take it), so an
-'exact'-only run still produces one row PER epsilon value swept (same
-exact value repeated) to line up with 'min_sum_k_median' rows -- this
-only works if the SAME --epsilon-values were used for both runs (true by
-construction if EPSILON_VALUES in submit_array_oar_kmedian_*.sh was not
-changed between the two job submissions).
+  - heuristique (min_sum_k_median_*) : cle (w_type, n, k, epsilon, seed,
+    instance) -- le resultat depend d'epsilon ;
+  - exact (exact_*) : cle (w_type, n, k, seed, instance) -- epsilon n'a
+    aucun sens pour la methode exacte et est ignore.
 
-Usage:
-    python3 merge_results_kmedian.py 'results/kmedian_*.parquet' \
+puis on rattache le resultat exact a chaque ligne heuristique (jointure
+externe : une instance resolue par une seule des deux methodes est
+conservee, avec des NaN pour l'autre), et on recalcule le ratio.
+
+Temps exact : la version actuelle de kmowa.py stocke le temps du calcul
+Gurobi dans le cache et le reecrit a chaque lecture du cache. Les
+fichiers produits par les versions precedentes contiennent en revanche
+exact_time = 0.0 pour les instances lues depuis le cache (une fois par
+epsilon apres le premier, ou apres une resoumission). Pour chaque
+instance on garde donc le temps le plus grand observe (le vrai calcul).
+Si aucun vrai temps n'est disponible (seulement 0.0 ou NaN), le temps
+est inconnu : il est mis a NaN et signale.
+
+Usage :
+    python3 merge_results_kmedian.py 'results/kmedian_*.parquet' \\
         --output kmedian_merged.parquet
 """
 
 import argparse
 import glob
+import os
 
 import numpy as np
 import pandas as pd
 
-KEY_COLS = ["w_type", "n", "k", "epsilon", "seed", "instance"]
+HEUR_KEY = ["w_type", "n", "k", "epsilon", "seed", "instance"]
+EXACT_KEY = ["w_type", "n", "k", "seed", "instance"]
+
+HEUR_COLS = ["min_sum_k_median_time", "min_sum_k_median_owa_obj",
+             "min_sum_k_median_nb_sols", "min_sum_k_median_S"]
+EXACT_COLS = ["exact_time", "exact_owa_obj", "exact_S"]
 
 
-def _combine_last_nonnull(series: pd.Series):
-    """Returns the last non-null value in the series, or NaN if all are
-    null. Used to combine several partial rows (one method's columns
-    filled, the other's NaN) sharing the same key into a single row."""
-    s = series.dropna()
-    return s.iloc[-1] if len(s) else np.nan
+def _read_all(paths):
+    dfs = []
+    # ordre chronologique : en cas de doublon, le fichier le plus recent gagne
+    for order, p in enumerate(sorted(paths, key=os.path.getmtime)):
+        try:
+            df = pd.read_parquet(p)
+        except Exception as e:
+            print(f"[ignore] impossible de lire {p} : {e}")
+            continue
+        missing = [c for c in EXACT_KEY + ["epsilon"] if c not in df.columns]
+        if missing:
+            print(f"[ignore] {p} : colonnes manquantes {missing}")
+            continue
+        for c in HEUR_COLS + EXACT_COLS:
+            if c not in df.columns:
+                df[c] = np.nan
+        df["_order"] = order
+        dfs.append(df)
+    return dfs
+
+
+def _heuristic_block(combined):
+    """Une ligne par (w_type, n, k, epsilon, seed, instance) ou l'heuristique a tourne."""
+    h = combined[combined["min_sum_k_median_time"].notna()
+                 | combined["min_sum_k_median_owa_obj"].notna()]
+    h = h[HEUR_KEY + HEUR_COLS + ["_order"]].copy()
+    # priorite : resultat present, puis fichier le plus recent
+    h["_has_obj"] = h["min_sum_k_median_owa_obj"].notna()
+    h = (h.sort_values(["_has_obj", "_order"])
+          .drop_duplicates(subset=HEUR_KEY, keep="last"))
+    return h.drop(columns=["_has_obj", "_order"])
+
+
+def _exact_block(combined):
+    """Une ligne par (w_type, n, k, seed, instance) ou l'exact a tourne (epsilon ignore)."""
+    e = combined[combined["exact_time"].notna() | combined["exact_owa_obj"].notna()]
+    e = e[EXACT_KEY + EXACT_COLS + ["_order"]].copy()
+
+    # temps reel = le plus grand observe pour l'instance (les autres valent 0.0, cache)
+    real_time = e.groupby(EXACT_KEY, dropna=False)["exact_time"].max()
+
+    # priorite : resultat present, puis fichier le plus recent
+    e["_has_obj"] = e["exact_owa_obj"].notna()
+    e = (e.sort_values(["_has_obj", "_order"])
+          .drop_duplicates(subset=EXACT_KEY, keep="last")
+          .drop(columns=["_has_obj", "_order", "exact_time"]))
+    e = e.merge(real_time.rename("exact_time").reset_index(), on=EXACT_KEY, how="left")
+
+    only_cache = ((e["exact_time"] == 0.0) | e["exact_time"].isna()) & e["exact_owa_obj"].notna()
+    if only_cache.any():
+        print(f"[attention] {only_cache.sum()} instance(s) exacte(s) lue(s) uniquement "
+              f"depuis le cache : temps inconnu, exact_time mis a NaN.")
+        e.loc[only_cache, "exact_time"] = np.nan
+    return e
 
 
 def merge(paths, output_path):
-    dfs = []
-    for p in paths:
-        try:
-            dfs.append(pd.read_parquet(p))
-        except Exception as e:
-            print(f"[ignore] could not read {p}: {e}")
-
+    dfs = _read_all(paths)
     if not dfs:
-        print("No readable file found.")
+        print("Aucun fichier lisible trouve.")
         return None
-
     combined = pd.concat(dfs, ignore_index=True)
 
-    missing_key_cols = [c for c in KEY_COLS if c not in combined.columns]
-    if missing_key_cols:
-        raise ValueError(
-            f"Key column(s) missing from the input files: {missing_key_cols}. "
-            "Are these really kmowa.py results?"
-        )
+    heur = _heuristic_block(combined)
+    exact = _exact_block(combined)
 
-    n_before_rows = len(combined)
-    other_cols = [c for c in combined.columns if c not in KEY_COLS]
+    merged = heur.merge(exact, on=EXACT_KEY, how="outer")
 
-    # Combine, per key, every non-key column by its last non-null value
-    # across all rows sharing that key (instead of dropping all but the
-    # last ROW, which would erase a method's results whenever the other
-    # method's row for the same key has NaN there -- see module docstring).
-    combined = (
-        combined
-        .groupby(KEY_COLS, as_index=False, dropna=False)
-        .agg({c: _combine_last_nonnull for c in other_cols})
-        .sort_values(by=KEY_COLS)
-        .reset_index(drop=True)
-    )
-    n_after_rows = len(combined)
-    if n_after_rows < n_before_rows:
-        print(f"{n_before_rows - n_after_rows} duplicate key(s) "
-              f"({', '.join(KEY_COLS)}) combined into one row each "
-              "(columns merged, not just the last row kept).")
+    ok = (merged["exact_owa_obj"].notna() & (merged["exact_owa_obj"] > 0)
+          & merged["min_sum_k_median_owa_obj"].notna())
+    merged["ratio_min_sum_k_median"] = np.where(
+        ok, merged["min_sum_k_median_owa_obj"] / merged["exact_owa_obj"], np.nan)
 
-    # ratio_min_sum_k_median could only be computed by run_one() when BOTH
-    # values were available in the SAME job -- an 'exact'-only row and a
-    # 'min_sum_k_median'-only row each had NaN there (missing the other
-    # side). Recompute it here now that both columns have been combined
-    # into one row, wherever both are present.
-    if {"exact_owa_obj", "min_sum_k_median_owa_obj"}.issubset(combined.columns):
-        can_compute = (
-            combined["exact_owa_obj"].notna()
-            & (combined["exact_owa_obj"] > 0)
-            & combined["min_sum_k_median_owa_obj"].notna()
-        )
-        combined.loc[can_compute, "ratio_min_sum_k_median"] = (
-            combined.loc[can_compute, "min_sum_k_median_owa_obj"]
-            / combined.loc[can_compute, "exact_owa_obj"]
-        )
+    cols = HEUR_KEY + HEUR_COLS + EXACT_COLS + ["ratio_min_sum_k_median"]
+    merged = (merged[cols]
+              .sort_values(by=HEUR_KEY, na_position="first")
+              .reset_index(drop=True))
 
-    combined.to_parquet(output_path, index=False)
-    print(f"{n_after_rows} rows written to {output_path}")
-    return combined
+    merged.to_parquet(output_path, index=False)
+    print(f"{len(merged)} lignes ecrites dans {output_path}")
+    _print_coverage(heur, exact)
+    return merged
+
+
+def _print_coverage(heur, exact):
+    """Nombre d'instances resolues par methode, par (w_type, n, k)."""
+    g = ["w_type", "n", "k"]
+    nb_exact = (exact[exact["exact_owa_obj"].notna()]
+                .groupby(g).size().rename("exact"))
+    nb_heur = (heur[heur["min_sum_k_median_owa_obj"].notna()]
+               .drop_duplicates(subset=EXACT_KEY)
+               .groupby(g).size().rename("min_sum_k_median"))
+    cov = pd.concat([nb_exact, nb_heur], axis=1).fillna(0).astype(int)
+    print("\nInstances resolues par (w_type, n, k) :")
+    print(cov.to_string())
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("patterns", nargs="+",
-                         help="paths or glob patterns of the parquet files to merge "
-                              "(e.g. 'results/kmedian_*.parquet')")
+                        help="chemins ou motifs glob des fichiers parquet a fusionner "
+                             "(ex. 'results/kmedian_*.parquet')")
     parser.add_argument("--output", default="kmedian_merged.parquet")
     args = parser.parse_args()
 
@@ -120,8 +158,11 @@ if __name__ == "__main__":
     for pattern in args.patterns:
         matched = glob.glob(pattern)
         paths.extend(matched if matched else [pattern])
+    # ne jamais relire le fichier de sortie lui-meme (s'il correspond au motif)
+    out = os.path.abspath(args.output)
+    paths = sorted({p for p in paths if os.path.abspath(p) != out})
 
-    print(f"{len(paths)} file(s) found:")
+    print(f"{len(paths)} fichier(s) trouve(s) :")
     for p in paths:
         print(" ", p)
 
