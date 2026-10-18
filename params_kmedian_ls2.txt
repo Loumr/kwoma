@@ -1,0 +1,9 @@
+20 15 min_sum_k_median
+30 15 min_sum_k_median
+30 20 min_sum_k_median
+40 15 min_sum_k_median
+40 20 min_sum_k_median
+40 25 min_sum_k_median
+50 20 min_sum_k_median
+50 25 min_sum_k_median
+50 30 min_sum_k_median
